@@ -1,0 +1,23 @@
+# Build output
+build/
+*.obj
+*.exp
+*.lib
+*.dll
+*.pdb
+*.ilk
+
+# Downloaded dependencies
+lib/
+include/
+
+# Editor / OS
+.vs/
+*.suo
+*.user
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Logs
+*.log
