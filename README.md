@@ -6,6 +6,10 @@ Open and save [WebP](https://developers.google.com/speed/webp) images directly i
 
 ![Paint Shop Pro 7 with WebP support](screenshot.png)
 
+The built-in **Browser** also supports WebP thumbnails and preview:
+
+![Browser showing WebP files](screenshot_browser.png)
+
 ## Quick Install (prebuilt)
 
 1. Go to the PSP 7 installation directory (where `psp.exe` lives)
