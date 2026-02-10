@@ -6,9 +6,15 @@ Open and save [WebP](https://developers.google.com/speed/webp) images directly i
 
 ![Paint Shop Pro 7 with WebP support](screenshot.png)
 
-The built-in **Browser** also supports WebP thumbnails and preview:
+## Why this project?
 
-![Browser showing WebP files](screenshot_browser.png)
+In 2026, Jasc Paint Shop Pro 7 — originally released in 2001 — remains a remarkably capable image editing and management tool for Windows. It runs flawlessly on the latest versions of Windows 11, and its lightweight, fast interface still holds up against modern alternatives.
+
+I grew up with this application. It was my go-to tool for everything from photo editing to batch processing. But as the web moved to newer formats like WebP, PSP 7 was left behind — Jasc Software was acquired by Corel, and version 7 was never updated again. Every time I downloaded a WebP image, I had to convert it in another program before opening it in PSP.
+
+This project fixes that. If anyone out there is still using Jasc Paint Shop Pro 7.04 (and I suspect some of us are), this plugin gives it native WebP support — no external converters needed.
+
+![WebP thumbnails in PSP 7 Browser](screenshot_browser.png)
 
 ## Quick Install (prebuilt)
 
@@ -30,6 +36,8 @@ This project creates a **proxy DLL** that replaces `jff.dll` — PSP 7's image f
   - `LoadJFFFilterString` / `LoadJFFFileIDString` — UI filter strings
 
 The rarely-used **IFF (Amiga)** format slot is repurposed for WebP. All other image formats (BMP, JPEG, PNG, GIF, TIFF, PSD, etc.) continue working normally through the original DLL.
+
+The built-in **Browser** window also supports WebP — thumbnails are generated and displayed just like any other supported format.
 
 ### Decode flow
 
@@ -107,8 +115,9 @@ psp7-webp/
 │   └── jff.dll        # The proxy DLL
 ├── lib/               # libwebp static library (auto-downloaded)
 ├── include/           # libwebp headers (auto-downloaded)
-├── screenshot.png     # Screenshot
-├── LICENSE            # MIT License
+├── screenshot.png          # Open dialog screenshot
+├── screenshot_browser.png  # Browser thumbnails screenshot
+├── LICENSE                 # MIT License
 └── README.md
 ```
 
