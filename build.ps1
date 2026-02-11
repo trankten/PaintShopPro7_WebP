@@ -45,7 +45,7 @@ Write-Host "[OK] Visual Studio: $vcvars" -ForegroundColor Green
 $libDir     = Join-Path $PSScriptRoot "lib"
 $includeDir = Join-Path $PSScriptRoot "include"
 
-if (-not (Test-Path (Join-Path $libDir "libwebp.lib"))) {
+if (-not (Test-Path (Join-Path $libDir "libwebp.lib")) -or -not (Test-Path (Join-Path $libDir "libwebpdemux.lib"))) {
     Write-Host "[*] Downloading libwebp ${LibWebPVersion}..." -ForegroundColor Yellow
 
     New-Item -ItemType Directory -Force -Path $libDir | Out-Null
@@ -117,6 +117,7 @@ $allExports = @(
     '?DecodeGIF@@YA?AW4JascErrorCode@@PAUtSFILEREQUEST@@@Z'
     '?DecodeGRD@@YA?AW4JascErrorCode@@PAUSGradientRequest@@@Z'
     # DecodeIFF - intercepted, not forwarded
+    # DecodePNG - intercepted (forwarded from code)
     '?DecodeIMG@@YA?AW4JascErrorCode@@PAUtSFILEREQUEST@@@Z'
     '?DecodeJPG@@YA?AW4JascErrorCode@@PAUtSFILEREQUEST@@@Z'
     '?DecodeKDC@@YA?AW4JascErrorCode@@PAUtSFILEREQUEST@@@Z'
@@ -127,7 +128,7 @@ $allExports = @(
     '?DecodePCX@@YA?AW4JascErrorCode@@PAUtSFILEREQUEST@@@Z'
     '?DecodePIC@@YA?AW4JascErrorCode@@PAUtSFILEREQUEST@@@Z'
     '?DecodePICT@@YA?AW4JascErrorCode@@PAUtSFILEREQUEST@@@Z'
-    '?DecodePNG@@YA?AW4JascErrorCode@@PAUtSFILEREQUEST@@@Z'
+    # DecodePNG - intercepted (forwarded from code)
     '?DecodePSD@@YA?AW4JascErrorCode@@PAUtSFILEREQUEST@@@Z'
     '?DecodePSP@@YA?AW4JascErrorCode@@PAUtSFILEREQUEST@@@Z'
     '?DecodePXM@@YA?AW4JascErrorCode@@PAUtSFILEREQUEST@@@Z'
@@ -159,6 +160,7 @@ $allExports = @(
     '?EncodeGIF@@YA?AW4JascErrorCode@@PAUtSFILEREQUEST@@@Z'
     '?EncodeGRD@@YA?AW4JascErrorCode@@PAUSGradientRequest@@@Z'
     # EncodeIFF - intercepted, not forwarded
+    # EncodePNG - intercepted (forwarded from code)
     '?EncodeIMG@@YA?AW4JascErrorCode@@PAUtSFILEREQUEST@@@Z'
     '?EncodeJPG@@YA?AW4JascErrorCode@@PAUtSFILEREQUEST@@@Z'
     '?EncodeMAC@@YA?AW4JascErrorCode@@PAUtSFILEREQUEST@@@Z'
@@ -166,7 +168,7 @@ $allExports = @(
     '?EncodePCX@@YA?AW4JascErrorCode@@PAUtSFILEREQUEST@@@Z'
     '?EncodePIC@@YA?AW4JascErrorCode@@PAUtSFILEREQUEST@@@Z'
     '?EncodePICT@@YA?AW4JascErrorCode@@PAUtSFILEREQUEST@@@Z'
-    '?EncodePNG@@YA?AW4JascErrorCode@@PAUtSFILEREQUEST@@@Z'
+    # EncodePNG - intercepted (forwarded from code)
     '?EncodePSD@@YA?AW4JascErrorCode@@PAUtSFILEREQUEST@@@Z'
     '?EncodePSP@@YA?AW4JascErrorCode@@PAUtSFILEREQUEST@@@Z'
     '?EncodePXM@@YA?AW4JascErrorCode@@PAUtSFILEREQUEST@@@Z'
@@ -212,7 +214,7 @@ $allExports = @(
     '?JffCheckVersion@@YA_NKKKK_N@Z'
     # LoadJFFFileIDString - intercepted
     # LoadJFFFilterString - intercepted
-    '?LoadJFFFormatDesc@@YA?AW4JascErrorCode@@PAUSFormatDesc@@PAUSEncodeParms@@@Z'
+    # LoadJFFFormatDesc - intercepted (forwarded from code)
     '?LoadJFFString@@YAPADIPADH@Z'
     '?MetaToDIB@@YA?AW4JascErrorCode@@PAUHWND__@@PAXPAUHMETAFILE__@@PAPAXUtagRECT@@HHHHH@Z'
     '?Open@CFileDiskBuffered@@QAE?AW4JascErrorCode@@PBDKW4EFileOpenMode@1@@Z'
@@ -277,9 +279,9 @@ New-Item -ItemType Directory -Force -Path $outDir | Out-Null
 $buildBat = @"
 @echo off
 call "$vcvars"
-cl /nologo /W3 /O2 /MT /D WIN32 /D NDEBUG /D _WINDOWS /D _USRDLL /D _CRT_SECURE_NO_WARNINGS /I"$includeDir" /c /TP "$srcDir\jff_proxy.cpp" /Fo"$outDir\jff_proxy.obj"
+cl /nologo /W3 /O2 /MT /EHsc /D WIN32 /D NDEBUG /D _WINDOWS /D _USRDLL /D _CRT_SECURE_NO_WARNINGS /I"$includeDir" /c /TP "$srcDir\jff_proxy.cpp" /Fo"$outDir\jff_proxy.obj"
 if errorlevel 1 exit /b 1
-link /nologo /DLL /DEF:"$srcDir\jff_proxy.def" /OUT:"$outDir\jff.dll" "$outDir\jff_proxy.obj" "$libDir\libwebp.lib" user32.lib kernel32.lib
+link /nologo /DLL /DEF:"$srcDir\jff_proxy.def" /OUT:"$outDir\jff.dll" "$outDir\jff_proxy.obj" "$libDir\libwebp.lib" "$libDir\libwebpdemux.lib" user32.lib kernel32.lib ole32.lib oleaut32.lib uuid.lib windowscodecs.lib advapi32.lib shell32.lib gdi32.lib comdlg32.lib comctl32.lib
 if errorlevel 1 exit /b 1
 echo BUILD_OK
 "@

@@ -2,7 +2,7 @@
 
 **Native WebP support for Paint Shop Pro 7.04**
 
-Open and save [WebP](https://developers.google.com/speed/webp) images directly in Jasc Paint Shop Pro 7.04
+Open and save [WebP](https://developers.google.com/speed/webp) images directly in Jasc Paint Shop Pro 7.04 — with full alpha channel support on read and experimental alpha preservation on write.
 
 ![Paint Shop Pro 7 with WebP support](screenshot.png)
 
@@ -15,6 +15,15 @@ I grew up with this application. It was my go-to tool for everything from photo 
 This project fixes that. If anyone out there is still using Jasc Paint Shop Pro 7.04 (and I suspect some of us are), this plugin gives it native WebP support — no external converters needed.
 
 ![WebP thumbnails in PSP 7 Browser](screenshot_browser.png)
+
+## Features
+
+- **Open WebP images** — including images with alpha (transparency) channels
+- **Save as WebP** — lossless or lossy, with configurable quality
+- **Alpha channel support** — full transparency on read; experimental preservation on write via "Save As"
+- **Options dialog** — configure compression mode, quality, and alpha settings when saving
+- **Browser thumbnails** — WebP files display thumbnails in PSP's built-in Browser window
+- **Settings persistence** — your preferences are saved across sessions
 
 ## Quick Install (prebuilt)
 
@@ -30,10 +39,12 @@ To uninstall, delete the proxy `jff.dll` and rename `jff_orig.dll` back to `jff.
 This project creates a **proxy DLL** that replaces `jff.dll` — PSP 7's image format library. The proxy:
 
 - Forwards all 178 original exports transparently to the renamed `jff_orig.dll`
-- Intercepts 6 functions to inject WebP read/write support:
+- Intercepts 10 functions to inject WebP read/write support:
   - `DecodeIFF` / `EncodeIFF` — read and write image data
+  - `DecodePNG` / `EncodePNG` — used as intermediate codec for alpha support
   - `ImageTypeByFilename` / `ImageTypeByJFile` — file type detection
   - `LoadJFFFilterString` / `LoadJFFFileIDString` — UI filter strings
+  - `LoadJFFFormatDesc` — format capabilities (reports PNG-like capabilities for alpha)
 
 The rarely-used **IFF (Amiga)** format slot is repurposed for WebP. All other image formats (BMP, JPEG, PNG, GIF, TIFF, PSD, etc.) continue working normally through the original DLL.
 
@@ -44,16 +55,47 @@ The built-in **Browser** window also supports WebP — thumbnails are generated 
 1. PSP calls `DecodeIFF` for the intercepted format
 2. The proxy reads the `.webp` file directly from disk
 3. [libwebp](https://developers.google.com/speed/webp/docs/api) decodes the WebP data to RGBA pixels
-4. Pixels are converted to an in-memory BMP
-5. The BMP is passed to PSP's internal `DecodeBMP` via a `CJFileMemory` object
+4. The alpha channel is cached in memory for later use during save
+5. Pixels are converted to an in-memory PNG (32-bit BGRA) via WIC
+6. The PNG is passed to PSP's internal `DecodePNG` via a `CJFileMemory` object
 
 ### Encode flow
 
 1. PSP calls `EncodeIFF` when saving as `.webp`
-2. The proxy redirects to `EncodeBMP`, which writes a BMP to disk
-3. The BMP file is read back, pixels extracted and converted to RGBA
-4. libwebp encodes the RGBA data to WebP (lossy, quality 85)
-5. The file is overwritten with the WebP data
+2. An options dialog is shown (configurable), allowing the user to set compression and alpha options
+3. The proxy redirects to `EncodePNG`, which writes a PNG to disk
+4. The PNG file is read back via WIC, extracting RGBA pixel data
+5. If alpha was cached during decode, it is restored (PSP may have discarded it)
+6. libwebp encodes the RGBA data to WebP (lossless or lossy per settings)
+7. The file is overwritten with the WebP data
+
+### Alpha channel preservation
+
+PSP 7 internally flattens images to 24-bit RGB when saving through JFF format codecs, discarding any alpha information. To work around this limitation, the plugin:
+
+1. **On load:** caches the original alpha channel from the WebP file in memory
+2. **On save:** restores the cached alpha data before encoding to WebP
+
+This approach works reliably when using **File → Save As** on the same image without resizing. It is considered experimental because the cached alpha is tied to the current session and image dimensions.
+
+## WebP Options
+
+When saving a WebP file, an options dialog appears with the following settings:
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| Lossless | On | Encode without quality loss (larger files) |
+| Preserve transparency | On | Restore cached alpha channel on save |
+| Quality (0-100) | 100 | Lossy compression quality (only when Lossless is off) |
+| Show this dialog when saving | On | Whether to show the options dialog on each save |
+
+Settings are persisted in the Windows registry under `HKCU\Software\Jasc\Paint Shop Pro\WebP`.
+
+## Important: Save vs Save As
+
+> **WebP saving only works with "File → Save As..."**
+>
+> The regular "File → Save" (Ctrl+S) command does not work for WebP files and will not produce a valid output file. Always use "File → Save As..." when saving WebP images. This is a limitation of how PSP 7 routes save operations for non-native formats.
 
 ## Build from source
 
@@ -90,19 +132,39 @@ To enable diagnostic logging, compile with `/D ENABLE_LOG=1`. The proxy will wri
 | Paint Shop Pro | 7.00–7.03 | Should work (same DLL interface) |
 | Paint Shop Pro | 8+ | Not tested (different DLL structure) |
 
-## Limitations
+## Known Limitations
 
-- The IFF (Amiga ILBM) format is no longer available through the Open/Save dialog. If you need IFF support, you can rename the `.iff` file and open it via another tool.
-- WebP encoding uses lossy compression at quality 85. Lossless encoding is not currently exposed.
-- WebP images with alpha channels are decoded to 24-bit RGB (alpha is discarded during BMP conversion).
-- Maximum file size: 100 MB.
+- The IFF (Amiga ILBM) format is no longer available through the Open/Save dialog.
+- **Save** (Ctrl+S) does not produce valid WebP files — use **Save As** instead.
+- Alpha preservation on save is experimental: it relies on a memory cache from the last decoded WebP image. Resizing the image or opening a different file before saving will invalidate the cache.
+- Maximum input file size: 100 MB.
+- WebP metadata (EXIF, ICC profiles) is not preserved.
+
+## Changelog
+
+### v2.0.0 (current)
+
+- Full alpha channel support on decode (via PNG intermediate instead of BMP)
+- Experimental alpha channel preservation on save (cache-based)
+- Lossless WebP encoding support
+- Configurable compression quality (0–100)
+- Options dialog shown on save (can be disabled)
+- Settings persisted in Windows registry
+- Format descriptor reports PNG-like capabilities (alpha, 24/32-bit)
+- Uses WIC (Windows Imaging Component) for intermediate PNG handling
+
+### v1.0.0
+
+- Initial release
+- Open and save WebP images (24-bit RGB only)
+- Fixed lossy encoding at quality 85
+- Browser thumbnail support
 
 ## Roadmap
 
-- [ ] Alpha channel support (preserve transparency on decode/encode)
-- [ ] Configurable compression quality
-- [ ] Lossless WebP encoding option
+- [ ] Make alpha preservation work with resized images
 - [ ] WebP metadata preservation (EXIF, ICC profiles)
+- [ ] Support "Save" (Ctrl+S) in addition to "Save As"
 
 ## Project structure
 
@@ -110,14 +172,14 @@ To enable diagnostic logging, compile with `/D ENABLE_LOG=1`. The proxy will wri
 psp7-webp/
 ├── build.ps1          # Build script (downloads deps, compiles, links)
 ├── src/
-│   └── jff_proxy.cpp  # Proxy DLL source (single file, ~400 lines)
+│   └── jff_proxy.cpp  # Proxy DLL source (single file)
 ├── build/             # Build output (generated)
 │   └── jff.dll        # The proxy DLL
-├── lib/               # libwebp static library (auto-downloaded)
+├── lib/               # libwebp static libraries (auto-downloaded)
 ├── include/           # libwebp headers (auto-downloaded)
-├── screenshot.png          # Open dialog screenshot
-├── screenshot_browser.png  # Browser thumbnails screenshot
-├── LICENSE                 # MIT License
+├── screenshot.png
+├── screenshot_browser.png
+├── LICENSE
 └── README.md
 ```
 

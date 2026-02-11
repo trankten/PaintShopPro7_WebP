@@ -50,7 +50,6 @@ EXPORTS
     ?DecodePCX@@YA?AW4JascErrorCode@@PAUtSFILEREQUEST@@@Z = jff_orig.?DecodePCX@@YA?AW4JascErrorCode@@PAUtSFILEREQUEST@@@Z
     ?DecodePIC@@YA?AW4JascErrorCode@@PAUtSFILEREQUEST@@@Z = jff_orig.?DecodePIC@@YA?AW4JascErrorCode@@PAUtSFILEREQUEST@@@Z
     ?DecodePICT@@YA?AW4JascErrorCode@@PAUtSFILEREQUEST@@@Z = jff_orig.?DecodePICT@@YA?AW4JascErrorCode@@PAUtSFILEREQUEST@@@Z
-    ?DecodePNG@@YA?AW4JascErrorCode@@PAUtSFILEREQUEST@@@Z = jff_orig.?DecodePNG@@YA?AW4JascErrorCode@@PAUtSFILEREQUEST@@@Z
     ?DecodePSD@@YA?AW4JascErrorCode@@PAUtSFILEREQUEST@@@Z = jff_orig.?DecodePSD@@YA?AW4JascErrorCode@@PAUtSFILEREQUEST@@@Z
     ?DecodePSP@@YA?AW4JascErrorCode@@PAUtSFILEREQUEST@@@Z = jff_orig.?DecodePSP@@YA?AW4JascErrorCode@@PAUtSFILEREQUEST@@@Z
     ?DecodePXM@@YA?AW4JascErrorCode@@PAUtSFILEREQUEST@@@Z = jff_orig.?DecodePXM@@YA?AW4JascErrorCode@@PAUtSFILEREQUEST@@@Z
@@ -88,7 +87,6 @@ EXPORTS
     ?EncodePCX@@YA?AW4JascErrorCode@@PAUtSFILEREQUEST@@@Z = jff_orig.?EncodePCX@@YA?AW4JascErrorCode@@PAUtSFILEREQUEST@@@Z
     ?EncodePIC@@YA?AW4JascErrorCode@@PAUtSFILEREQUEST@@@Z = jff_orig.?EncodePIC@@YA?AW4JascErrorCode@@PAUtSFILEREQUEST@@@Z
     ?EncodePICT@@YA?AW4JascErrorCode@@PAUtSFILEREQUEST@@@Z = jff_orig.?EncodePICT@@YA?AW4JascErrorCode@@PAUtSFILEREQUEST@@@Z
-    ?EncodePNG@@YA?AW4JascErrorCode@@PAUtSFILEREQUEST@@@Z = jff_orig.?EncodePNG@@YA?AW4JascErrorCode@@PAUtSFILEREQUEST@@@Z
     ?EncodePSD@@YA?AW4JascErrorCode@@PAUtSFILEREQUEST@@@Z = jff_orig.?EncodePSD@@YA?AW4JascErrorCode@@PAUtSFILEREQUEST@@@Z
     ?EncodePSP@@YA?AW4JascErrorCode@@PAUtSFILEREQUEST@@@Z = jff_orig.?EncodePSP@@YA?AW4JascErrorCode@@PAUtSFILEREQUEST@@@Z
     ?EncodePXM@@YA?AW4JascErrorCode@@PAUtSFILEREQUEST@@@Z = jff_orig.?EncodePXM@@YA?AW4JascErrorCode@@PAUtSFILEREQUEST@@@Z
@@ -130,7 +128,6 @@ EXPORTS
     ?InvertDIB@@YA?AW4JascErrorCode@@PAVStatusControlBlock@@PAXPAPAX@Z = jff_orig.?InvertDIB@@YA?AW4JascErrorCode@@PAVStatusControlBlock@@PAXPAPAX@Z
     ?IsBackgroundLayer@@YA_NPAUSLayerData@@@Z = jff_orig.?IsBackgroundLayer@@YA_NPAUSLayerData@@@Z
     ?JffCheckVersion@@YA_NKKKK_N@Z = jff_orig.?JffCheckVersion@@YA_NKKKK_N@Z
-    ?LoadJFFFormatDesc@@YA?AW4JascErrorCode@@PAUSFormatDesc@@PAUSEncodeParms@@@Z = jff_orig.?LoadJFFFormatDesc@@YA?AW4JascErrorCode@@PAUSFormatDesc@@PAUSEncodeParms@@@Z
     ?LoadJFFString@@YAPADIPADH@Z = jff_orig.?LoadJFFString@@YAPADIPADH@Z
     ?MetaToDIB@@YA?AW4JascErrorCode@@PAUHWND__@@PAXPAUHMETAFILE__@@PAPAXUtagRECT@@HHHHH@Z = jff_orig.?MetaToDIB@@YA?AW4JascErrorCode@@PAUHWND__@@PAXPAUHMETAFILE__@@PAPAXUtagRECT@@HHHHH@Z
     ?Open@CFileDiskBuffered@@QAE?AW4JascErrorCode@@PBDKW4EFileOpenMode@1@@Z = jff_orig.?Open@CFileDiskBuffered@@QAE?AW4JascErrorCode@@PBDKW4EFileOpenMode@1@@Z

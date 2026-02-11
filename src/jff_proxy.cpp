@@ -5,14 +5,11 @@
  * See LICENSE file for details.
  *
  * This proxy DLL replaces jff.dll in PSP 7.04, forwarding all original
- * exports to the renamed jff_orig.dll while intercepting 6 functions
+ * exports to the renamed jff_orig.dll while intercepting functions
  * to add native WebP read/write support via Google's libwebp.
  *
  * The IFF (Amiga) format slot is repurposed for WebP since IFF is
  * rarely used. All other formats remain fully functional.
- *
- * Build: compile as C++ (x86/32-bit) with MSVC to produce correct
- *        C++ name mangling compatible with PSP's import table.
  */
 
 extern "C" {
@@ -25,27 +22,35 @@ extern "C" {
 #include "webp/encode.h"
 }
 
+#include <wincodec.h>
+
 /* ===== Types matching PSP 7's internal C++ ABI ===== */
 
 enum JascErrorCode {
-    JascOK          = 0,
+    JascOK            = 0,
     JascError_General = 0x05,
     JascError_Param   = 0x65
 };
 
 enum tagJascFileFormats {
     JFF_FMT_BMP = 0x01,
-    JFF_FMT_IFF = 0x0B
+    JFF_FMT_IFF = 0x0B,
+    JFF_FMT_PNG = 0x1C
 };
 
 struct tSFILEREQUEST;
 class  vcJFile;
 
+struct SFormatDesc  { unsigned char data[0xD2]; };
+struct SEncodeParms { unsigned char data[0x282]; };
+
 /* ===== Request structure offsets (PSP 7.04) ===== */
 
-#define OFFSET_FILENAME  0x70
-#define OFFSET_JFILE     0x48E
-#define OFFSET_BMPINFO   0x492
+#define OFFSET_FILENAME        0x70
+#define OFFSET_JFILE           0x48E
+#define OFFSET_BMPINFO         0x492
+#define FORMATDESC_MAGIC       0xD2
+#define ENCODEPARMS_FORMAT_OFF 0x04
 
 /* ===== Function pointer types ===== */
 
@@ -54,6 +59,7 @@ typedef JascErrorCode (__cdecl *fn_EncodeFormat)(tSFILEREQUEST*);
 typedef JascErrorCode (__cdecl *fn_ImageTypeByFilename)(const char*, tagJascFileFormats*);
 typedef JascErrorCode (__cdecl *fn_ImageTypeByJFile)(vcJFile*, tagJascFileFormats*);
 typedef char*         (__cdecl *fn_LoadJFFString)(tagJascFileFormats, char*, int);
+typedef JascErrorCode (__cdecl *fn_LoadJFFFormatDesc)(SFormatDesc*, SEncodeParms*);
 
 typedef void (__fastcall *fn_MemFile_Ctor)(void* pThis, void* edx);
 typedef int  (__fastcall *fn_MemFile_SetPtr)(void* pThis, void* edx, BYTE* data, DWORD sz);
@@ -64,10 +70,13 @@ typedef int  (__fastcall *fn_MemFile_SetPtr)(void* pThis, void* edx, BYTE* data,
 #define MN_EncodeIFF  "?EncodeIFF@@YA?AW4JascErrorCode@@PAUtSFILEREQUEST@@@Z"
 #define MN_DecodeBMP  "?DecodeBMP@@YA?AW4JascErrorCode@@PAUtSFILEREQUEST@@@Z"
 #define MN_EncodeBMP  "?EncodeBMP@@YA?AW4JascErrorCode@@PAUtSFILEREQUEST@@@Z"
+#define MN_DecodePNG  "?DecodePNG@@YA?AW4JascErrorCode@@PAUtSFILEREQUEST@@@Z"
+#define MN_EncodePNG  "?EncodePNG@@YA?AW4JascErrorCode@@PAUtSFILEREQUEST@@@Z"
 #define MN_ImgByFile  "?ImageTypeByFilename@@YA?AW4JascErrorCode@@PBDPAW4tagJascFileFormats@@@Z"
 #define MN_ImgByJFile "?ImageTypeByJFile@@YA?AW4JascErrorCode@@PAVvcJFile@@PAW4tagJascFileFormats@@@Z"
 #define MN_FilterStr  "?LoadJFFFilterString@@YAPADW4tagJascFileFormats@@PADH@Z"
 #define MN_FileIDStr  "?LoadJFFFileIDString@@YAPADW4tagJascFileFormats@@PADH@Z"
+#define MN_FormatDesc "?LoadJFFFormatDesc@@YA?AW4JascErrorCode@@PAUSFormatDesc@@PAUSEncodeParms@@@Z"
 #define MN_MemCtor    "??0CJFileMemory@@QAE@XZ"
 #define MN_MemSetPtr  "?SetPointerMemoryMode@CJFileMemory@@QAEHPAEK@Z"
 
@@ -80,10 +89,13 @@ static fn_DecodeFormat        g_origDecodeIFF           = NULL;
 static fn_EncodeFormat        g_origEncodeIFF           = NULL;
 static fn_DecodeFormat        g_origDecodeBMP           = NULL;
 static fn_EncodeFormat        g_origEncodeBMP           = NULL;
+static fn_DecodeFormat        g_origDecodePNG           = NULL;
+static fn_EncodeFormat        g_origEncodePNG           = NULL;
 static fn_ImageTypeByFilename g_origImageTypeByFilename = NULL;
 static fn_ImageTypeByJFile    g_origImageTypeByJFile    = NULL;
 static fn_LoadJFFString       g_origLoadJFFFilterString = NULL;
 static fn_LoadJFFString       g_origLoadJFFFileIDString = NULL;
+static fn_LoadJFFFormatDesc   g_origLoadJFFFormatDesc   = NULL;
 static fn_MemFile_Ctor        g_origMemFileCtor         = NULL;
 static fn_MemFile_SetPtr      g_origMemFileSetPtr       = NULL;
 
@@ -118,6 +130,247 @@ static void ProxyLog(const char* fmt, ...)
 #endif
 }
 
+/* ===== Alpha channel cache =====
+ *
+ * PSP 7 flattens images to 24-bit RGB when saving through JFF codecs,
+ * discarding any alpha information. To work around this, we cache the
+ * alpha channel when a WebP is first decoded and restore it at encode
+ * time, effectively preserving transparency through the save cycle.
+ * This only works for "Save As" on the same image without resizing.
+ */
+
+static BYTE* g_cachedAlpha    = NULL;
+static int   g_cachedAlphaW   = 0;
+static int   g_cachedAlphaH   = 0;
+static BOOL  g_cachedAlphaHas = FALSE;
+
+static void CacheAlphaChannel(const BYTE* rgba, int w, int h)
+{
+    int i, total;
+
+    if (g_cachedAlpha) {
+        VirtualFree(g_cachedAlpha, 0, MEM_RELEASE);
+        g_cachedAlpha = NULL;
+    }
+    g_cachedAlphaW = 0;
+    g_cachedAlphaH = 0;
+    g_cachedAlphaHas = FALSE;
+
+    if (!rgba || w <= 0 || h <= 0) return;
+
+    total = w * h;
+    for (i = 0; i < total; i++) {
+        if (rgba[i * 4 + 3] < 255) {
+            g_cachedAlphaHas = TRUE;
+            break;
+        }
+    }
+    if (!g_cachedAlphaHas) return;
+
+    g_cachedAlpha = (BYTE*)VirtualAlloc(NULL, total, MEM_COMMIT, PAGE_READWRITE);
+    if (!g_cachedAlpha) { g_cachedAlphaHas = FALSE; return; }
+
+    for (i = 0; i < total; i++)
+        g_cachedAlpha[i] = rgba[i * 4 + 3];
+
+    g_cachedAlphaW = w;
+    g_cachedAlphaH = h;
+    ProxyLog("CacheAlpha: %dx%d", w, h);
+}
+
+static BOOL RestoreAlphaChannel(BYTE* rgba, int w, int h)
+{
+    int i, total;
+
+    if (!g_cachedAlpha || !g_cachedAlphaHas) return FALSE;
+    if (w != g_cachedAlphaW || h != g_cachedAlphaH) return FALSE;
+
+    total = w * h;
+    for (i = 0; i < total; i++)
+        rgba[i * 4 + 3] = g_cachedAlpha[i];
+
+    ProxyLog("RestoreAlpha: %dx%d", w, h);
+    return TRUE;
+}
+
+/* ===== WebP settings (persisted in registry) ===== */
+
+static BOOL g_settingsLoaded    = FALSE;
+static BOOL g_lossless          = TRUE;
+static int  g_quality           = 100;
+static BOOL g_preserveAlpha     = TRUE;
+static BOOL g_showOptionsOnSave = TRUE;
+
+static void LoadSettings(void)
+{
+    HKEY hKey;
+    DWORD val = 0, sz = sizeof(DWORD), type = 0;
+
+    if (RegOpenKeyExA(HKEY_CURRENT_USER, "Software\\Jasc\\Paint Shop Pro\\WebP",
+                      0, KEY_READ, &hKey) != ERROR_SUCCESS) {
+        g_settingsLoaded = TRUE;
+        return;
+    }
+
+    sz = sizeof(DWORD);
+    if (RegQueryValueExA(hKey, "Lossless", NULL, &type, (LPBYTE)&val, &sz) == ERROR_SUCCESS)
+        g_lossless = (val != 0);
+    sz = sizeof(DWORD);
+    if (RegQueryValueExA(hKey, "Quality", NULL, &type, (LPBYTE)&val, &sz) == ERROR_SUCCESS)
+        if ((int)val >= 0 && (int)val <= 100) g_quality = (int)val;
+    sz = sizeof(DWORD);
+    if (RegQueryValueExA(hKey, "PreserveAlpha", NULL, &type, (LPBYTE)&val, &sz) == ERROR_SUCCESS)
+        g_preserveAlpha = (val != 0);
+    sz = sizeof(DWORD);
+    if (RegQueryValueExA(hKey, "ShowOptionsOnSave", NULL, &type, (LPBYTE)&val, &sz) == ERROR_SUCCESS)
+        g_showOptionsOnSave = (val != 0);
+
+    RegCloseKey(hKey);
+    g_settingsLoaded = TRUE;
+}
+
+static void SaveSettings(void)
+{
+    HKEY hKey;
+    DWORD val;
+
+    if (RegCreateKeyExA(HKEY_CURRENT_USER, "Software\\Jasc\\Paint Shop Pro\\WebP",
+                        0, NULL, 0, KEY_WRITE, NULL, &hKey, NULL) != ERROR_SUCCESS)
+        return;
+
+    val = g_lossless ? 1 : 0;
+    RegSetValueExA(hKey, "Lossless", 0, REG_DWORD, (const BYTE*)&val, sizeof(DWORD));
+    val = (DWORD)g_quality;
+    RegSetValueExA(hKey, "Quality", 0, REG_DWORD, (const BYTE*)&val, sizeof(DWORD));
+    val = g_preserveAlpha ? 1 : 0;
+    RegSetValueExA(hKey, "PreserveAlpha", 0, REG_DWORD, (const BYTE*)&val, sizeof(DWORD));
+    val = g_showOptionsOnSave ? 1 : 0;
+    RegSetValueExA(hKey, "ShowOptionsOnSave", 0, REG_DWORD, (const BYTE*)&val, sizeof(DWORD));
+
+    RegCloseKey(hKey);
+}
+
+static void EnsureSettingsLoaded(void)
+{
+    if (!g_settingsLoaded) LoadSettings();
+}
+
+/* ===== WebP options dialog (built in memory, no .rc needed) ===== */
+
+#define IDC_WEBP_LOSSLESS  1001
+#define IDC_WEBP_ALPHA     1002
+#define IDC_WEBP_QUALITY   1003
+#define IDC_WEBP_SHOWSAVE  1004
+
+static void UpdateQualityEnabled(HWND hDlg)
+{
+    BOOL lossless = (IsDlgButtonChecked(hDlg, IDC_WEBP_LOSSLESS) == BST_CHECKED);
+    EnableWindow(GetDlgItem(hDlg, IDC_WEBP_QUALITY), !lossless);
+}
+
+static INT_PTR CALLBACK WebPOptionsDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM)
+{
+    switch (msg) {
+    case WM_INITDIALOG:
+        CheckDlgButton(hDlg, IDC_WEBP_LOSSLESS, g_lossless ? BST_CHECKED : BST_UNCHECKED);
+        CheckDlgButton(hDlg, IDC_WEBP_ALPHA, g_preserveAlpha ? BST_CHECKED : BST_UNCHECKED);
+        CheckDlgButton(hDlg, IDC_WEBP_SHOWSAVE, g_showOptionsOnSave ? BST_CHECKED : BST_UNCHECKED);
+        SetDlgItemInt(hDlg, IDC_WEBP_QUALITY, (UINT)g_quality, FALSE);
+        UpdateQualityEnabled(hDlg);
+        return TRUE;
+
+    case WM_COMMAND:
+        switch (LOWORD(wParam)) {
+        case IDC_WEBP_LOSSLESS:
+            UpdateQualityEnabled(hDlg);
+            return TRUE;
+        case IDOK: {
+            BOOL ok = FALSE;
+            UINT q = GetDlgItemInt(hDlg, IDC_WEBP_QUALITY, &ok, FALSE);
+            g_lossless = (IsDlgButtonChecked(hDlg, IDC_WEBP_LOSSLESS) == BST_CHECKED);
+            g_preserveAlpha = (IsDlgButtonChecked(hDlg, IDC_WEBP_ALPHA) == BST_CHECKED);
+            g_showOptionsOnSave = (IsDlgButtonChecked(hDlg, IDC_WEBP_SHOWSAVE) == BST_CHECKED);
+            if (!ok || q > 100) q = 100;
+            g_quality = (int)q;
+            SaveSettings();
+            EndDialog(hDlg, IDOK);
+            return TRUE;
+        }
+        case IDCANCEL:
+            EndDialog(hDlg, IDCANCEL);
+            return TRUE;
+        }
+        break;
+    }
+    return FALSE;
+}
+
+static BYTE* AlignDlgPtr(BYTE* p)
+{
+    ULONG_PTR v = (ULONG_PTR)p;
+    return (BYTE*)((v + 3) & ~(ULONG_PTR)3);
+}
+
+static BYTE* AddDlgStringW(BYTE* p, const wchar_t* s)
+{
+    while (*s) { *(wchar_t*)p = *s++; p += sizeof(wchar_t); }
+    *(wchar_t*)p = 0; p += sizeof(wchar_t);
+    return p;
+}
+
+static BYTE* AddDlgItem(BYTE* p, DWORD style, short x, short y, short cx, short cy,
+                        WORD id, WORD classAtom, const wchar_t* title)
+{
+    p = AlignDlgPtr(p);
+    DLGITEMTEMPLATE* it = (DLGITEMTEMPLATE*)p;
+    it->style = style;
+    it->dwExtendedStyle = 0;
+    it->x = x; it->y = y; it->cx = cx; it->cy = cy;
+    it->id = id;
+    p += sizeof(DLGITEMTEMPLATE);
+    *(WORD*)p = 0xFFFF; p += sizeof(WORD);
+    *(WORD*)p = classAtom; p += sizeof(WORD);
+    p = AddDlgStringW(p, title);
+    *(WORD*)p = 0; p += sizeof(WORD);
+    return p;
+}
+
+static void ShowWebPOptionsDialog(HWND parent)
+{
+    void* mem = GlobalAlloc(GPTR, 2048);
+    if (!mem) return;
+
+    DLGTEMPLATE* dlg = (DLGTEMPLATE*)mem;
+    dlg->style = WS_POPUP | WS_CAPTION | WS_SYSMENU | DS_MODALFRAME | DS_SETFONT;
+    dlg->cdit = 7;
+    dlg->x = 10; dlg->y = 10; dlg->cx = 200; dlg->cy = 110;
+
+    BYTE* p = (BYTE*)(dlg + 1);
+    *(WORD*)p = 0; p += sizeof(WORD);
+    *(WORD*)p = 0; p += sizeof(WORD);
+    p = AddDlgStringW(p, L"WebP Options");
+    *(WORD*)p = 8; p += sizeof(WORD);
+    p = AddDlgStringW(p, L"MS Shell Dlg");
+
+    p = AddDlgItem(p, WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX,
+                   8,8,180,12, IDC_WEBP_LOSSLESS, 0x0080, L"Lossless");
+    p = AddDlgItem(p, WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX,
+                   8,24,180,12, IDC_WEBP_ALPHA, 0x0080, L"Preserve transparency (alpha)");
+    p = AddDlgItem(p, WS_CHILD|WS_VISIBLE|SS_LEFT,
+                   8,40,90,10, 0, 0x0082, L"Quality (0-100):");
+    p = AddDlgItem(p, WS_CHILD|WS_VISIBLE|WS_BORDER|ES_NUMBER,
+                   105,38,40,12, IDC_WEBP_QUALITY, 0x0081, L"");
+    p = AddDlgItem(p, WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX,
+                   8,56,180,12, IDC_WEBP_SHOWSAVE, 0x0080, L"Show this dialog when saving");
+    p = AddDlgItem(p, WS_CHILD|WS_VISIBLE|BS_DEFPUSHBUTTON,
+                   40,78,50,14, IDOK, 0x0080, L"OK");
+    p = AddDlgItem(p, WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON,
+                   110,78,50,14, IDCANCEL, 0x0080, L"Cancel");
+
+    DialogBoxIndirectParamW(g_hSelf, (DLGTEMPLATE*)mem, parent, WebPOptionsDlgProc, 0);
+    GlobalFree(mem);
+}
+
 /* ===== Utilities ===== */
 
 static BOOL HasExtension(const char* path, const char* ext)
@@ -132,6 +385,158 @@ static BOOL IsWebPMagic(const BYTE* hdr, int len)
     if (len < 12) return FALSE;
     return (hdr[0] == 'R' && hdr[1] == 'I' && hdr[2] == 'F' && hdr[3] == 'F' &&
             hdr[8] == 'W' && hdr[9] == 'E' && hdr[10] == 'B' && hdr[11] == 'P');
+}
+
+/* ===== WIC-based PNG encode/decode (alpha-preserving intermediate) ===== */
+
+static BYTE* CreatePNGFromRGBA(int w, int h, const BYTE* rgba, DWORD* pPngSz)
+{
+    IWICImagingFactory* factory = NULL;
+    IWICStream* stream = NULL;
+    IWICBitmapEncoder* encoder = NULL;
+    IWICBitmapFrameEncode* frame = NULL;
+    BYTE* result = NULL;
+    HRESULT hr;
+    char tmpDir[MAX_PATH], tmpFile[MAX_PATH];
+
+    *pPngSz = 0;
+    hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    if (FAILED(hr) && hr != RPC_E_CHANGED_MODE) return NULL;
+
+    GetTempPathA(MAX_PATH, tmpDir);
+    GetTempFileNameA(tmpDir, "wbp", 0, tmpFile);
+
+    hr = CoCreateInstance(CLSID_WICImagingFactory, NULL, CLSCTX_INPROC_SERVER,
+                          IID_PPV_ARGS(&factory));
+    if (FAILED(hr)) goto done;
+    hr = factory->CreateStream(&stream);
+    if (FAILED(hr)) goto done;
+
+    {
+        WCHAR wTmp[MAX_PATH];
+        MultiByteToWideChar(CP_ACP, 0, tmpFile, -1, wTmp, MAX_PATH);
+        hr = stream->InitializeFromFilename(wTmp, GENERIC_WRITE);
+    }
+    if (FAILED(hr)) goto done;
+
+    hr = factory->CreateEncoder(GUID_ContainerFormatPng, NULL, &encoder);
+    if (FAILED(hr)) goto done;
+    hr = encoder->Initialize((IStream*)stream, WICBitmapEncoderNoCache);
+    if (FAILED(hr)) goto done;
+    hr = encoder->CreateNewFrame(&frame, NULL);
+    if (FAILED(hr)) goto done;
+    hr = frame->Initialize(NULL);
+    if (FAILED(hr)) goto done;
+    hr = frame->SetSize(w, h);
+    if (FAILED(hr)) goto done;
+
+    {
+        WICPixelFormatGUID fmt = GUID_WICPixelFormat32bppBGRA;
+        hr = frame->SetPixelFormat(&fmt);
+        if (FAILED(hr)) goto done;
+
+        BYTE* row = (BYTE*)VirtualAlloc(NULL, w * 4, MEM_COMMIT, PAGE_READWRITE);
+        if (!row) goto done;
+
+        for (int y = 0; y < h; y++) {
+            const BYTE* src = rgba + y * w * 4;
+            for (int x = 0; x < w; x++) {
+                row[x*4+0] = src[x*4+2];
+                row[x*4+1] = src[x*4+1];
+                row[x*4+2] = src[x*4+0];
+                row[x*4+3] = src[x*4+3];
+            }
+            frame->WritePixels(1, w * 4, w * 4, row);
+        }
+        VirtualFree(row, 0, MEM_RELEASE);
+    }
+
+    frame->Commit();
+    encoder->Commit();
+    if (frame) frame->Release(); frame = NULL;
+    if (encoder) encoder->Release(); encoder = NULL;
+    if (stream) stream->Release(); stream = NULL;
+    if (factory) factory->Release(); factory = NULL;
+
+    {
+        FILE* fp = fopen(tmpFile, "rb");
+        if (fp) {
+            fseek(fp, 0, SEEK_END);
+            *pPngSz = (DWORD)ftell(fp);
+            fseek(fp, 0, SEEK_SET);
+            result = (BYTE*)VirtualAlloc(NULL, *pPngSz, MEM_COMMIT, PAGE_READWRITE);
+            if (result) fread(result, 1, *pPngSz, fp);
+            fclose(fp);
+        }
+    }
+
+done:
+    if (frame) frame->Release();
+    if (encoder) encoder->Release();
+    if (stream) stream->Release();
+    if (factory) factory->Release();
+    DeleteFileA(tmpFile);
+    CoUninitialize();
+    return result;
+}
+
+static BYTE* DecodePngToRGBA(const char* path, int* outW, int* outH)
+{
+    IWICImagingFactory* factory = NULL;
+    IWICBitmapDecoder* decoder = NULL;
+    IWICBitmapFrameDecode* frame = NULL;
+    IWICFormatConverter* converter = NULL;
+    BYTE* pixels = NULL;
+    UINT w = 0, h = 0;
+    HRESULT hr;
+
+    *outW = *outH = 0;
+    hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    if (FAILED(hr) && hr != RPC_E_CHANGED_MODE) return NULL;
+
+    hr = CoCreateInstance(CLSID_WICImagingFactory, NULL, CLSCTX_INPROC_SERVER,
+                          IID_PPV_ARGS(&factory));
+    if (FAILED(hr)) goto done;
+
+    {
+        WCHAR wpath[MAX_PATH];
+        int n = MultiByteToWideChar(CP_UTF8, 0, path, -1, wpath, MAX_PATH);
+        if (n <= 0) n = MultiByteToWideChar(CP_ACP, 0, path, -1, wpath, MAX_PATH);
+        if (n <= 0) { hr = E_FAIL; goto done; }
+        hr = factory->CreateDecoderFromFilename(wpath, NULL, GENERIC_READ,
+                                                WICDecodeMetadataCacheOnLoad, &decoder);
+    }
+    if (FAILED(hr)) goto done;
+    hr = decoder->GetFrame(0, &frame);
+    if (FAILED(hr)) goto done;
+    hr = frame->GetSize(&w, &h);
+    if (FAILED(hr) || w == 0 || h == 0) goto done;
+
+    hr = factory->CreateFormatConverter(&converter);
+    if (FAILED(hr)) goto done;
+    hr = converter->Initialize(frame, GUID_WICPixelFormat32bppRGBA,
+                               WICBitmapDitherTypeNone, NULL, 0.0,
+                               WICBitmapPaletteTypeCustom);
+    if (FAILED(hr)) goto done;
+
+    pixels = (BYTE*)VirtualAlloc(NULL, w * h * 4, MEM_COMMIT, PAGE_READWRITE);
+    if (!pixels) goto done;
+    hr = converter->CopyPixels(NULL, w * 4, w * h * 4, pixels);
+    if (FAILED(hr)) {
+        VirtualFree(pixels, 0, MEM_RELEASE);
+        pixels = NULL;
+        goto done;
+    }
+    *outW = (int)w;
+    *outH = (int)h;
+
+done:
+    if (converter) converter->Release();
+    if (frame) frame->Release();
+    if (decoder) decoder->Release();
+    if (factory) factory->Release();
+    CoUninitialize();
+    return pixels;
 }
 
 /* vcJFile vtable wrappers (__thiscall via __fastcall trick) */
@@ -151,49 +556,6 @@ static DWORD JFile_Seek(void* pJFile, long offset, int origin)
     return ((fn_JFile_Seek)vt[8])(pJFile, NULL, offset, origin);
 }
 
-/* ===== BMP construction from RGBA pixels ===== */
-
-static BYTE* CreateBMPFromRGBA(int w, int h, const BYTE* rgba, DWORD* pBmpSz)
-{
-    int   rowBytes = ((w * 3 + 3) / 4) * 4;
-    DWORD pixelSz  = (DWORD)rowBytes * h;
-    DWORD totalSz  = 14 + 40 + pixelSz;
-    BYTE* bmp;
-    int   x, y;
-
-    bmp = (BYTE*)VirtualAlloc(NULL, totalSz, MEM_COMMIT, PAGE_READWRITE);
-    if (!bmp) return NULL;
-
-    /* BITMAPFILEHEADER */
-    bmp[0] = 'B'; bmp[1] = 'M';
-    *(DWORD*)(bmp + 2)  = totalSz;
-    *(DWORD*)(bmp + 6)  = 0;
-    *(DWORD*)(bmp + 10) = 14 + 40;
-
-    /* BITMAPINFOHEADER */
-    *(DWORD*)(bmp + 14) = 40;
-    *(LONG* )(bmp + 18) = w;
-    *(LONG* )(bmp + 22) = h;
-    *(WORD* )(bmp + 26) = 1;
-    *(WORD* )(bmp + 28) = 24;
-    *(DWORD*)(bmp + 30) = 0;
-    *(DWORD*)(bmp + 34) = pixelSz;
-
-    /* Pixel data: RGBA top-down -> BGR bottom-up */
-    for (y = 0; y < h; y++) {
-        const BYTE* src = rgba + (h - 1 - y) * w * 4;
-        BYTE*       dst = bmp + 54 + y * rowBytes;
-        for (x = 0; x < w; x++) {
-            dst[x * 3 + 0] = src[x * 4 + 2];
-            dst[x * 3 + 1] = src[x * 4 + 1];
-            dst[x * 3 + 2] = src[x * 4 + 0];
-        }
-    }
-
-    *pBmpSz = totalSz;
-    return bmp;
-}
-
 /* ===== WebP Decode ===== */
 
 static JascErrorCode DecodeWebP(tSFILEREQUEST* pReq)
@@ -201,10 +563,10 @@ static JascErrorCode DecodeWebP(tSFILEREQUEST* pReq)
     char* filename = (char*)((BYTE*)pReq + OFFSET_FILENAME);
     FILE* fp;
     long  fileSz;
-    BYTE* fileData    = NULL;
-    BYTE* rgbaPixels  = NULL;
-    BYTE* bmpData     = NULL;
-    DWORD bmpSz;
+    BYTE* fileData   = NULL;
+    BYTE* rgbaPixels = NULL;
+    BYTE* pngData    = NULL;
+    DWORD pngSz;
     BYTE* pMemFileObj = NULL;
     void* pOrigJFile;
     int   w, h;
@@ -213,7 +575,7 @@ static JascErrorCode DecodeWebP(tSFILEREQUEST* pReq)
     ProxyLog("DecodeWebP: %s", filename);
 
     fp = fopen(filename, "rb");
-    if (!fp) return g_origDecodeIFF(pReq);
+    if (!fp) return g_origDecodePNG(pReq);
 
     fseek(fp, 0, SEEK_END);
     fileSz = ftell(fp);
@@ -221,7 +583,7 @@ static JascErrorCode DecodeWebP(tSFILEREQUEST* pReq)
 
     if (fileSz < 12 || fileSz > 100 * 1024 * 1024) {
         fclose(fp);
-        return g_origDecodeIFF(pReq);
+        return g_origDecodePNG(pReq);
     }
 
     fileData = (BYTE*)VirtualAlloc(NULL, fileSz, MEM_COMMIT, PAGE_READWRITE);
@@ -231,7 +593,7 @@ static JascErrorCode DecodeWebP(tSFILEREQUEST* pReq)
 
     if (!IsWebPMagic(fileData, (int)fileSz)) {
         VirtualFree(fileData, 0, MEM_RELEASE);
-        return g_origDecodeIFF(pReq);
+        return g_origDecodePNG(pReq);
     }
 
     rgbaPixels = WebPDecodeRGBA(fileData, (size_t)fileSz, &w, &h);
@@ -242,29 +604,36 @@ static JascErrorCode DecodeWebP(tSFILEREQUEST* pReq)
         return JascError_General;
     }
 
-    bmpData = CreateBMPFromRGBA(w, h, rgbaPixels, &bmpSz);
+    CacheAlphaChannel(rgbaPixels, w, h);
+
+    pngData = CreatePNGFromRGBA(w, h, rgbaPixels, &pngSz);
     WebPFree(rgbaPixels);
-    if (!bmpData) return JascError_General;
+
+    if (!pngData || pngSz == 0) {
+        if (pngData) VirtualFree(pngData, 0, MEM_RELEASE);
+        return JascError_General;
+    }
+
+    ProxyLog("DecodeWebP: PNG %d bytes (%dx%d)", (int)pngSz, w, h);
 
     pMemFileObj = (BYTE*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, 4096);
     if (!pMemFileObj) {
-        VirtualFree(bmpData, 0, MEM_RELEASE);
+        VirtualFree(pngData, 0, MEM_RELEASE);
         return JascError_General;
     }
 
     g_origMemFileCtor(pMemFileObj, NULL);
-    g_origMemFileSetPtr(pMemFileObj, NULL, bmpData, bmpSz);
+    g_origMemFileSetPtr(pMemFileObj, NULL, pngData, pngSz);
 
     pOrigJFile = *(void**)((BYTE*)pReq + OFFSET_JFILE);
     *(void**)((BYTE*)pReq + OFFSET_JFILE) = pMemFileObj;
 
-    result = g_origDecodeBMP(pReq);
-    ProxyLog("DecodeWebP: DecodeBMP returned %d", (int)result);
+    result = g_origDecodePNG(pReq);
+    ProxyLog("DecodeWebP: DecodePNG -> %d", (int)result);
 
     *(void**)((BYTE*)pReq + OFFSET_JFILE) = pOrigJFile;
-
     HeapFree(GetProcessHeap(), 0, pMemFileObj);
-    VirtualFree(bmpData, 0, MEM_RELEASE);
+    VirtualFree(pngData, 0, MEM_RELEASE);
 
     return result;
 }
@@ -276,94 +645,90 @@ static JascErrorCode EncodeWebP(tSFILEREQUEST* pReq)
     char* filename = (char*)((BYTE*)pReq + OFFSET_FILENAME);
     char  origFilename[520];
     FILE* fp;
-    BYTE* bmpData  = NULL;
     BYTE* rgbaData = NULL;
     BYTE* webpOut  = NULL;
-    size_t webpSz;
-    long  bmpSz;
-    int   w, h, rowBytes, x, y;
+    size_t webpSz  = 0;
+    int   w = 0, h = 0;
     JascErrorCode result;
 
     strncpy(origFilename, filename, sizeof(origFilename) - 1);
     origFilename[sizeof(origFilename) - 1] = 0;
     ProxyLog("EncodeWebP: %s", origFilename);
 
-    /* Let PSP write a BMP via its internal encoder */
-    result = g_origEncodeBMP(pReq);
+    EnsureSettingsLoaded();
+
+    /* Ask PSP to write an intermediate file via its PNG encoder */
+    result = g_origEncodePNG(pReq);
     if (result != JascOK) {
-        result = g_origEncodeIFF(pReq);
+        result = g_origEncodeBMP(pReq);
         if (result != JascOK) return result;
     }
 
-    /* Read the intermediate file back */
-    fp = fopen(origFilename, "rb");
-    if (!fp) return JascOK;
+    /* Read the intermediate back as RGBA */
+    rgbaData = DecodePngToRGBA(origFilename, &w, &h);
 
-    fseek(fp, 0, SEEK_END);
-    bmpSz = ftell(fp);
-    fseek(fp, 0, SEEK_SET);
+    if (!rgbaData || w <= 0 || h <= 0) {
+        if (rgbaData) { VirtualFree(rgbaData, 0, MEM_RELEASE); rgbaData = NULL; }
 
-    if (bmpSz < 54) { fclose(fp); return JascOK; }
+        /* Fallback: try reading as BMP */
+        long bmpSz; int x, y;
+        fp = fopen(origFilename, "rb");
+        if (!fp) return JascOK;
+        fseek(fp, 0, SEEK_END); bmpSz = ftell(fp); fseek(fp, 0, SEEK_SET);
+        if (bmpSz < 54) { fclose(fp); return JascOK; }
 
-    bmpData = (BYTE*)VirtualAlloc(NULL, bmpSz, MEM_COMMIT, PAGE_READWRITE);
-    if (!bmpData) { fclose(fp); return JascOK; }
-    fread(bmpData, 1, bmpSz, fp);
-    fclose(fp);
+        BYTE* bmpData = (BYTE*)VirtualAlloc(NULL, bmpSz, MEM_COMMIT, PAGE_READWRITE);
+        if (!bmpData) { fclose(fp); return JascOK; }
+        fread(bmpData, 1, bmpSz, fp); fclose(fp);
 
-    if (bmpData[0] != 'B' || bmpData[1] != 'M') {
-        VirtualFree(bmpData, 0, MEM_RELEASE);
-        return JascOK;
-    }
+        if (bmpData[0] != 'B' || bmpData[1] != 'M') {
+            VirtualFree(bmpData, 0, MEM_RELEASE);
+            return JascOK;
+        }
 
-    w = *(int*)(bmpData + 18);
-    h = *(int*)(bmpData + 22);
-    if (h < 0) h = -h;
+        w = *(int*)(bmpData + 18);
+        h = *(int*)(bmpData + 22);
+        if (h < 0) h = -h;
 
-    {
         WORD  bpp        = *(WORD*)(bmpData + 28);
         DWORD dataOffset = *(DWORD*)(bmpData + 10);
 
-        if (bpp != 24 && bpp != 32) {
-            VirtualFree(bmpData, 0, MEM_RELEASE);
-            return JascOK;
-        }
+        if (bpp != 24 && bpp != 32) { VirtualFree(bmpData, 0, MEM_RELEASE); return JascOK; }
 
         rgbaData = (BYTE*)VirtualAlloc(NULL, w * h * 4, MEM_COMMIT, PAGE_READWRITE);
-        if (!rgbaData) {
-            VirtualFree(bmpData, 0, MEM_RELEASE);
-            return JascOK;
-        }
+        if (!rgbaData) { VirtualFree(bmpData, 0, MEM_RELEASE); return JascOK; }
 
-        if (bpp == 24) {
-            rowBytes = ((w * 3 + 3) / 4) * 4;
-            for (y = 0; y < h; y++) {
-                BYTE* src = bmpData + dataOffset + (h - 1 - y) * rowBytes;
-                BYTE* dst = rgbaData + y * w * 4;
-                for (x = 0; x < w; x++) {
-                    dst[x * 4 + 0] = src[x * 3 + 2];
-                    dst[x * 4 + 1] = src[x * 3 + 1];
-                    dst[x * 4 + 2] = src[x * 3 + 0];
-                    dst[x * 4 + 3] = 255;
-                }
-            }
-        } else {
-            rowBytes = w * 4;
-            for (y = 0; y < h; y++) {
-                BYTE* src = bmpData + dataOffset + (h - 1 - y) * rowBytes;
-                BYTE* dst = rgbaData + y * w * 4;
-                for (x = 0; x < w; x++) {
-                    dst[x * 4 + 0] = src[x * 4 + 2];
-                    dst[x * 4 + 1] = src[x * 4 + 1];
-                    dst[x * 4 + 2] = src[x * 4 + 0];
-                    dst[x * 4 + 3] = src[x * 4 + 3];
+        int rowBytes = (bpp == 24) ? ((w * 3 + 3) / 4) * 4 : w * 4;
+        for (y = 0; y < h; y++) {
+            BYTE* src = bmpData + dataOffset + (h - 1 - y) * rowBytes;
+            BYTE* dst = rgbaData + y * w * 4;
+            for (x = 0; x < w; x++) {
+                if (bpp == 24) {
+                    dst[x*4+0] = src[x*3+2]; dst[x*4+1] = src[x*3+1];
+                    dst[x*4+2] = src[x*3+0]; dst[x*4+3] = 255;
+                } else {
+                    dst[x*4+0] = src[x*4+2]; dst[x*4+1] = src[x*4+1];
+                    dst[x*4+2] = src[x*4+0]; dst[x*4+3] = src[x*4+3];
                 }
             }
         }
+        VirtualFree(bmpData, 0, MEM_RELEASE);
     }
 
-    VirtualFree(bmpData, 0, MEM_RELEASE);
+    if (!rgbaData) return JascOK;
 
-    webpSz = WebPEncodeRGBA(rgbaData, w, h, w * 4, 85.0f, &webpOut);
+    /* Restore cached alpha (PSP flattens it for non-native formats) */
+    if (g_preserveAlpha)
+        RestoreAlphaChannel(rgbaData, w, h);
+
+    if (g_lossless) {
+        webpSz = WebPEncodeLosslessRGBA(rgbaData, w, h, w * 4, &webpOut);
+    } else {
+        float q = (float)g_quality;
+        if (q < 0.0f) q = 0.0f;
+        if (q > 100.0f) q = 100.0f;
+        webpSz = WebPEncodeRGBA(rgbaData, w, h, w * 4, q, &webpOut);
+    }
     VirtualFree(rgbaData, 0, MEM_RELEASE);
 
     if (webpSz == 0 || !webpOut) return JascOK;
@@ -378,6 +743,15 @@ static JascErrorCode EncodeWebP(tSFILEREQUEST* pReq)
     return JascOK;
 }
 
+/* ===== Format descriptor ===== */
+
+static void SetFormatDescStrings(SFormatDesc* desc, const char* name)
+{
+    lstrcpynA((char*)desc->data + 0x08, name, 0x31);
+    lstrcpynA((char*)desc->data + 0x6D, name, 0x31);
+    lstrcpynA((char*)desc->data + 0xA0, name, 0x31);
+}
+
 /* ===== Intercepted exports ===== */
 
 #define JFFEXPORT __declspec(dllexport)
@@ -385,21 +759,32 @@ static JascErrorCode EncodeWebP(tSFILEREQUEST* pReq)
 JFFEXPORT JascErrorCode __cdecl DecodeIFF(tSFILEREQUEST* pReq)
 {
     if (!pReq) return g_origDecodeIFF(pReq);
-
     char* filename = (char*)((BYTE*)pReq + OFFSET_FILENAME);
     if (filename[0] != '\0' && HasExtension(filename, ".webp"))
         return DecodeWebP(pReq);
-
     return g_origDecodeIFF(pReq);
+}
+
+JFFEXPORT JascErrorCode __cdecl DecodePNG(tSFILEREQUEST* pReq)
+{
+    return g_origDecodePNG(pReq);
 }
 
 JFFEXPORT JascErrorCode __cdecl EncodeIFF(tSFILEREQUEST* pReq)
 {
     char* filename = (char*)((BYTE*)pReq + OFFSET_FILENAME);
-    if (HasExtension(filename, ".webp"))
+    if (HasExtension(filename, ".webp")) {
+        EnsureSettingsLoaded();
+        if (g_showOptionsOnSave)
+            ShowWebPOptionsDialog(GetActiveWindow());
         return EncodeWebP(pReq);
-
+    }
     return g_origEncodeIFF(pReq);
+}
+
+JFFEXPORT JascErrorCode __cdecl EncodePNG(tSFILEREQUEST* pReq)
+{
+    return g_origEncodePNG(pReq);
 }
 
 JFFEXPORT JascErrorCode __cdecl ImageTypeByFilename(const char* path, tagJascFileFormats* pFmt)
@@ -429,7 +814,7 @@ JFFEXPORT JascErrorCode __cdecl ImageTypeByJFile(vcJFile* pJFile, tagJascFileFor
 JFFEXPORT char* __cdecl LoadJFFFilterString(tagJascFileFormats fmt, char* buf, int len)
 {
     if (fmt == JFF_FMT_IFF) {
-        strncpy(buf, "WebP Image Format|*.WEBP|", len - 1);
+        strncpy(buf, "WebP|*.WEBP|", len - 1);
         buf[len - 1] = 0;
         return buf;
     }
@@ -444,6 +829,32 @@ JFFEXPORT char* __cdecl LoadJFFFileIDString(tagJascFileFormats fmt, char* buf, i
         return buf;
     }
     return g_origLoadJFFFileIDString(fmt, buf, len);
+}
+
+JFFEXPORT JascErrorCode __cdecl LoadJFFFormatDesc(SFormatDesc* desc, SEncodeParms* parms)
+{
+    if (!desc || !parms || !g_origLoadJFFFormatDesc)
+        return JascError_Param;
+
+    if (*(unsigned int*)(parms->data + ENCODEPARMS_FORMAT_OFF) != JFF_FMT_IFF)
+        return g_origLoadJFFFormatDesc(desc, parms);
+
+    /* Borrow PNG capabilities so PSP treats WebP as an alpha-capable format */
+    SEncodeParms tmpParms;
+    memcpy(&tmpParms, parms, sizeof(SEncodeParms));
+    *(unsigned int*)(tmpParms.data + ENCODEPARMS_FORMAT_OFF) = JFF_FMT_PNG;
+
+    SFormatDesc tmpDesc;
+    memset(&tmpDesc, 0, sizeof(SFormatDesc));
+    *(unsigned int*)tmpDesc.data = FORMATDESC_MAGIC;
+
+    JascErrorCode res = g_origLoadJFFFormatDesc(&tmpDesc, &tmpParms);
+    if (res != JascOK) return res;
+
+    memcpy(desc, &tmpDesc, sizeof(SFormatDesc));
+    *(unsigned int*)desc->data = FORMATDESC_MAGIC;
+    SetFormatDescStrings(desc, "WebP Image Format");
+    return JascOK;
 }
 
 /* ===== Initialization ===== */
@@ -471,16 +882,21 @@ static BOOL LoadOriginalDll(void)
     g_origEncodeIFF           = (fn_EncodeFormat)GetProcAddress(g_hOrigDll, MN_EncodeIFF);
     g_origDecodeBMP           = (fn_DecodeFormat)GetProcAddress(g_hOrigDll, MN_DecodeBMP);
     g_origEncodeBMP           = (fn_EncodeFormat)GetProcAddress(g_hOrigDll, MN_EncodeBMP);
+    g_origDecodePNG           = (fn_DecodeFormat)GetProcAddress(g_hOrigDll, MN_DecodePNG);
+    g_origEncodePNG           = (fn_EncodeFormat)GetProcAddress(g_hOrigDll, MN_EncodePNG);
     g_origImageTypeByFilename = (fn_ImageTypeByFilename)GetProcAddress(g_hOrigDll, MN_ImgByFile);
     g_origImageTypeByJFile    = (fn_ImageTypeByJFile)GetProcAddress(g_hOrigDll, MN_ImgByJFile);
     g_origLoadJFFFilterString = (fn_LoadJFFString)GetProcAddress(g_hOrigDll, MN_FilterStr);
     g_origLoadJFFFileIDString = (fn_LoadJFFString)GetProcAddress(g_hOrigDll, MN_FileIDStr);
+    g_origLoadJFFFormatDesc   = (fn_LoadJFFFormatDesc)GetProcAddress(g_hOrigDll, MN_FormatDesc);
     g_origMemFileCtor         = (fn_MemFile_Ctor)GetProcAddress(g_hOrigDll, MN_MemCtor);
     g_origMemFileSetPtr       = (fn_MemFile_SetPtr)GetProcAddress(g_hOrigDll, MN_MemSetPtr);
 
     if (!g_origDecodeIFF || !g_origDecodeBMP || !g_origEncodeBMP ||
+        !g_origDecodePNG || !g_origEncodePNG ||
         !g_origImageTypeByFilename || !g_origImageTypeByJFile ||
         !g_origLoadJFFFilterString || !g_origLoadJFFFileIDString ||
+        !g_origLoadJFFFormatDesc ||
         !g_origMemFileCtor || !g_origMemFileSetPtr) {
         MessageBoxA(NULL, "Failed to resolve exports from jff_orig.dll",
                     "WebP Plugin - Error", MB_OK | MB_ICONERROR);
@@ -498,6 +914,7 @@ extern "C" BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID)
         if (!LoadOriginalDll()) return FALSE;
     }
     else if (fdwReason == DLL_PROCESS_DETACH) {
+        if (g_cachedAlpha) VirtualFree(g_cachedAlpha, 0, MEM_RELEASE);
         if (g_hOrigDll) FreeLibrary(g_hOrigDll);
     }
     return TRUE;

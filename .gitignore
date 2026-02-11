@@ -21,3 +21,6 @@ Desktop.ini
 
 # Logs
 *.log
+
+# Backup files
+*_v1.*
