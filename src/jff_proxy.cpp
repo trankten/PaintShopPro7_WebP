@@ -10,6 +10,16 @@
  *
  * The IFF (Amiga) format slot is repurposed for WebP since IFF is
  * rarely used. All other formats remain fully functional.
+ *
+ * PATCHED VERSION (changes marked with [PATCH]):
+ *  1. EncodeIFF no longer depends on the file extension. "Save" makes PSP
+ *     write to a temporary name, so the extension check failed and the
+ *     original IFF encoder wrote an ILBM file.
+ *  2. DecodeIFF decides by file content, not by extension.
+ *  3. DecodeWebP falls back to the original IFF decoder (or to the PNG
+ *     decoder if the file really is a PNG) instead of always using PNG.
+ *  4. EncodeWebP returns an error (and removes the intermediate file)
+ *     instead of reporting success when something fails.
  */
 
 extern "C" {
@@ -387,6 +397,13 @@ static BOOL IsWebPMagic(const BYTE* hdr, int len)
             hdr[8] == 'W' && hdr[9] == 'E' && hdr[10] == 'B' && hdr[11] == 'P');
 }
 
+/* [PATCH] PNG signature check, used by the decode fallback */
+static BOOL IsPngMagic(const BYTE* hdr, int len)
+{
+    if (len < 4) return FALSE;
+    return (hdr[0] == 0x89 && hdr[1] == 'P' && hdr[2] == 'N' && hdr[3] == 'G');
+}
+
 /* ===== WIC-based PNG encode/decode (alpha-preserving intermediate) ===== */
 
 static BYTE* CreatePNGFromRGBA(int w, int h, const BYTE* rgba, DWORD* pPngSz)
@@ -563,6 +580,7 @@ static JascErrorCode DecodeWebP(tSFILEREQUEST* pReq)
     char* filename = (char*)((BYTE*)pReq + OFFSET_FILENAME);
     FILE* fp;
     long  fileSz;
+    BYTE  hdr[12] = {0};
     BYTE* fileData   = NULL;
     BYTE* rgbaPixels = NULL;
     BYTE* pngData    = NULL;
@@ -574,8 +592,13 @@ static JascErrorCode DecodeWebP(tSFILEREQUEST* pReq)
 
     ProxyLog("DecodeWebP: %s", filename);
 
+    /* [PATCH] Anything that is not a WebP goes to the original IFF decoder
+       (or to the PNG decoder if it really is a PNG), never blindly to PNG. */
     fp = fopen(filename, "rb");
-    if (!fp) return g_origDecodePNG(pReq);
+    if (!fp) {
+        ProxyLog("DecodeWebP: cannot open file, -> orig DecodeIFF");
+        return g_origDecodeIFF(pReq);
+    }
 
     fseek(fp, 0, SEEK_END);
     fileSz = ftell(fp);
@@ -583,23 +606,36 @@ static JascErrorCode DecodeWebP(tSFILEREQUEST* pReq)
 
     if (fileSz < 12 || fileSz > 100 * 1024 * 1024) {
         fclose(fp);
-        return g_origDecodePNG(pReq);
+        ProxyLog("DecodeWebP: bad size %ld, -> orig DecodeIFF", fileSz);
+        return g_origDecodeIFF(pReq);
     }
 
+    if (fread(hdr, 1, 12, fp) != 12) {
+        fclose(fp);
+        return g_origDecodeIFF(pReq);
+    }
+
+    if (!IsWebPMagic(hdr, 12)) {
+        fclose(fp);
+        if (IsPngMagic(hdr, 12)) {
+            ProxyLog("DecodeWebP: file is a PNG, -> orig DecodePNG");
+            return g_origDecodePNG(pReq);
+        }
+        ProxyLog("DecodeWebP: not WebP, -> orig DecodeIFF");
+        return g_origDecodeIFF(pReq);
+    }
+
+    fseek(fp, 0, SEEK_SET);
     fileData = (BYTE*)VirtualAlloc(NULL, fileSz, MEM_COMMIT, PAGE_READWRITE);
     if (!fileData) { fclose(fp); return JascError_General; }
     fread(fileData, 1, fileSz, fp);
     fclose(fp);
 
-    if (!IsWebPMagic(fileData, (int)fileSz)) {
-        VirtualFree(fileData, 0, MEM_RELEASE);
-        return g_origDecodePNG(pReq);
-    }
-
     rgbaPixels = WebPDecodeRGBA(fileData, (size_t)fileSz, &w, &h);
     VirtualFree(fileData, 0, MEM_RELEASE);
 
     if (!rgbaPixels || w <= 0 || h <= 0) {
+        ProxyLog("DecodeWebP: libwebp failed to decode");
         if (rgbaPixels) WebPFree(rgbaPixels);
         return JascError_General;
     }
@@ -640,6 +676,15 @@ static JascErrorCode DecodeWebP(tSFILEREQUEST* pReq)
 
 /* ===== WebP Encode ===== */
 
+/* [PATCH] On failure: log, remove the intermediate PNG/BMP that PSP wrote
+   under the target name (it is NOT a WebP), and report an error to PSP. */
+static JascErrorCode EncodeFail(const char* path, const char* why)
+{
+    ProxyLog("EncodeWebP FAILED: %s", why);
+    DeleteFileA(path);
+    return JascError_General;
+}
+
 static JascErrorCode EncodeWebP(tSFILEREQUEST* pReq)
 {
     char* filename = (char*)((BYTE*)pReq + OFFSET_FILENAME);
@@ -660,8 +705,13 @@ static JascErrorCode EncodeWebP(tSFILEREQUEST* pReq)
     /* Ask PSP to write an intermediate file via its PNG encoder */
     result = g_origEncodePNG(pReq);
     if (result != JascOK) {
+        ProxyLog("EncodeWebP: EncodePNG -> %d, trying EncodeBMP", (int)result);
         result = g_origEncodeBMP(pReq);
-        if (result != JascOK) return result;
+        if (result != JascOK) {
+            ProxyLog("EncodeWebP: EncodeBMP -> %d", (int)result);
+            DeleteFileA(origFilename);
+            return result;
+        }
     }
 
     /* Read the intermediate back as RGBA */
@@ -673,17 +723,17 @@ static JascErrorCode EncodeWebP(tSFILEREQUEST* pReq)
         /* Fallback: try reading as BMP */
         long bmpSz; int x, y;
         fp = fopen(origFilename, "rb");
-        if (!fp) return JascOK;
+        if (!fp) return EncodeFail(origFilename, "cannot reopen intermediate file");
         fseek(fp, 0, SEEK_END); bmpSz = ftell(fp); fseek(fp, 0, SEEK_SET);
-        if (bmpSz < 54) { fclose(fp); return JascOK; }
+        if (bmpSz < 54) { fclose(fp); return EncodeFail(origFilename, "intermediate file too small"); }
 
         BYTE* bmpData = (BYTE*)VirtualAlloc(NULL, bmpSz, MEM_COMMIT, PAGE_READWRITE);
-        if (!bmpData) { fclose(fp); return JascOK; }
+        if (!bmpData) { fclose(fp); return EncodeFail(origFilename, "out of memory (bmp)"); }
         fread(bmpData, 1, bmpSz, fp); fclose(fp);
 
         if (bmpData[0] != 'B' || bmpData[1] != 'M') {
             VirtualFree(bmpData, 0, MEM_RELEASE);
-            return JascOK;
+            return EncodeFail(origFilename, "intermediate is neither PNG nor BMP");
         }
 
         w = *(int*)(bmpData + 18);
@@ -693,10 +743,16 @@ static JascErrorCode EncodeWebP(tSFILEREQUEST* pReq)
         WORD  bpp        = *(WORD*)(bmpData + 28);
         DWORD dataOffset = *(DWORD*)(bmpData + 10);
 
-        if (bpp != 24 && bpp != 32) { VirtualFree(bmpData, 0, MEM_RELEASE); return JascOK; }
+        if (bpp != 24 && bpp != 32) {
+            VirtualFree(bmpData, 0, MEM_RELEASE);
+            return EncodeFail(origFilename, "unsupported BMP bit depth");
+        }
 
         rgbaData = (BYTE*)VirtualAlloc(NULL, w * h * 4, MEM_COMMIT, PAGE_READWRITE);
-        if (!rgbaData) { VirtualFree(bmpData, 0, MEM_RELEASE); return JascOK; }
+        if (!rgbaData) {
+            VirtualFree(bmpData, 0, MEM_RELEASE);
+            return EncodeFail(origFilename, "out of memory (rgba)");
+        }
 
         int rowBytes = (bpp == 24) ? ((w * 3 + 3) / 4) * 4 : w * 4;
         for (y = 0; y < h; y++) {
@@ -715,7 +771,7 @@ static JascErrorCode EncodeWebP(tSFILEREQUEST* pReq)
         VirtualFree(bmpData, 0, MEM_RELEASE);
     }
 
-    if (!rgbaData) return JascOK;
+    if (!rgbaData) return EncodeFail(origFilename, "no pixel data");
 
     /* Restore cached alpha (PSP flattens it for non-native formats) */
     if (g_preserveAlpha)
@@ -731,11 +787,18 @@ static JascErrorCode EncodeWebP(tSFILEREQUEST* pReq)
     }
     VirtualFree(rgbaData, 0, MEM_RELEASE);
 
-    if (webpSz == 0 || !webpOut) return JascOK;
+    if (webpSz == 0 || !webpOut) {
+        if (webpOut) WebPFree(webpOut);
+        return EncodeFail(origFilename, "libwebp encode failed");
+    }
 
     fp = fopen(origFilename, "wb");
-    if (!fp) { WebPFree(webpOut); return JascOK; }
-    fwrite(webpOut, 1, webpSz, fp);
+    if (!fp) { WebPFree(webpOut); return EncodeFail(origFilename, "cannot write output file"); }
+    if (fwrite(webpOut, 1, webpSz, fp) != webpSz) {
+        fclose(fp);
+        WebPFree(webpOut);
+        return EncodeFail(origFilename, "short write");
+    }
     fclose(fp);
 
     ProxyLog("EncodeWebP: %dx%d -> %zu bytes", w, h, webpSz);
@@ -759,10 +822,10 @@ static void SetFormatDescStrings(SFormatDesc* desc, const char* name)
 JFFEXPORT JascErrorCode __cdecl DecodeIFF(tSFILEREQUEST* pReq)
 {
     if (!pReq) return g_origDecodeIFF(pReq);
+    /* [PATCH] Decide by content inside DecodeWebP, not by extension. */
     char* filename = (char*)((BYTE*)pReq + OFFSET_FILENAME);
-    if (filename[0] != '\0' && HasExtension(filename, ".webp"))
-        return DecodeWebP(pReq);
-    return g_origDecodeIFF(pReq);
+    ProxyLog("DecodeIFF: filename='%s'", filename);
+    return DecodeWebP(pReq);
 }
 
 JFFEXPORT JascErrorCode __cdecl DecodePNG(tSFILEREQUEST* pReq)
@@ -773,13 +836,13 @@ JFFEXPORT JascErrorCode __cdecl DecodePNG(tSFILEREQUEST* pReq)
 JFFEXPORT JascErrorCode __cdecl EncodeIFF(tSFILEREQUEST* pReq)
 {
     char* filename = (char*)((BYTE*)pReq + OFFSET_FILENAME);
-    if (HasExtension(filename, ".webp")) {
-        EnsureSettingsLoaded();
-        if (g_showOptionsOnSave)
-            ShowWebPOptionsDialog(GetActiveWindow());
-        return EncodeWebP(pReq);
-    }
-    return g_origEncodeIFF(pReq);
+    /* [PATCH] The IFF slot is fully repurposed for WebP: always encode WebP,
+       whatever the (possibly temporary, as with "Save") file name is. */
+    ProxyLog("EncodeIFF: filename='%s'", filename);
+    EnsureSettingsLoaded();
+    if (g_showOptionsOnSave)
+        ShowWebPOptionsDialog(GetActiveWindow());
+    return EncodeWebP(pReq);
 }
 
 JFFEXPORT JascErrorCode __cdecl EncodePNG(tSFILEREQUEST* pReq)
