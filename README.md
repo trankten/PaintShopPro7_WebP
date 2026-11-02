@@ -91,18 +91,16 @@ When saving a WebP file, an options dialog appears with the following settings:
 
 Settings are persisted in the Windows registry under `HKCU\Software\Jasc\Paint Shop Pro\WebP`.
 
-## Important: Save vs Save As
+## Save and Save As Support
 
-> **WebP saving only works with "File → Save As..."**
->
-> The regular "File → Save" (Ctrl+S) command does not work for WebP files and will not produce a valid output file. Always use "File → Save As..." when saving WebP images. This is a limitation of how PSP 7 routes save operations for non-native formats.
+Both **File → Save** (Ctrl+S) and **File → Save As...** are fully supported. The plugin intercepts the encoding requests directly, properly handling PSP 7's temporary files created during regular saves.
 
 ## Build from source
 
 ### Requirements
 
 - **Windows** (32-bit output required)
-- **Visual Studio 2019 or 2022** with "Desktop development with C++" workload (x86 tools)
+- **Visual Studio 2019, 2022 or 2026** with "Desktop development with C++" workload (x86 tools)
 - **PowerShell 5.1+**
 - Internet connection (to download libwebp on first build)
 
@@ -135,14 +133,21 @@ To enable diagnostic logging, compile with `/D ENABLE_LOG=1`. The proxy will wri
 ## Known Limitations
 
 - The IFF (Amiga ILBM) format is no longer available through the Open/Save dialog.
-- **Save** (Ctrl+S) does not produce valid WebP files — use **Save As** instead.
 - Alpha preservation on save is experimental: it relies on a memory cache from the last decoded WebP image. Resizing the image or opening a different file before saving will invalidate the cache.
 - Maximum input file size: 100 MB.
 - WebP metadata (EXIF, ICC profiles) is not preserved.
 
 ## Changelog
 
-### v2.0.0 (current)
+### v2.1.0 (current)
+
+- Fixed "Save" (Ctrl+S) producing Amiga IFF/ILBM files instead of WebP (contributed by [@OinkEsFabuloso](https://github.com/OinkEsFabuloso) in [#1](https://github.com/trankten/PaintShopPro7_WebP/pull/1))
+- `EncodeIFF` now unconditionally encodes WebP, correctly handling PSP's temporary save files
+- `DecodeIFF` now detects format by file content and magic header bytes instead of extension
+- `DecodeWebP` adds fallback to original `DecodeIFF` (or `DecodePNG` if PNG signature is detected) for non-WebP files
+- `EncodeWebP` now cleans up intermediate files and reports errors properly to PSP on failure
+
+### v2.0.0
 
 - Full alpha channel support on decode (via PNG intermediate instead of BMP)
 - Experimental alpha channel preservation on save (cache-based)
@@ -164,7 +169,11 @@ To enable diagnostic logging, compile with `/D ENABLE_LOG=1`. The proxy will wri
 
 - [ ] Make alpha preservation work with resized images
 - [ ] WebP metadata preservation (EXIF, ICC profiles)
-- [ ] Support "Save" (Ctrl+S) in addition to "Save As"
+- [x] Support "Save" (Ctrl+S) in addition to "Save As" (v2.1.0)
+
+## Credits & Acknowledgments
+
+- Special thanks to [@OinkEsFabuloso](https://github.com/OinkEsFabuloso) for diagnosing the temporary file behavior in PSP 7's save routine and contributing the fix in [PR #1](https://github.com/trankten/PaintShopPro7_WebP/pull/1).
 
 ## Project structure
 

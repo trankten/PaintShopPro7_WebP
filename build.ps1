@@ -19,6 +19,7 @@ $LibWebPUrl     = "https://storage.googleapis.com/downloads.webmproject.org/rele
 
 $vcvars = $null
 $vcPaths = @(
+    "C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvars32.bat",
     "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars32.bat",
     "C:\Program Files (x86)\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars32.bat",
     "C:\Program Files\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars32.bat",
@@ -288,7 +289,7 @@ echo BUILD_OK
 
 $batFile = Join-Path $outDir "_build.bat"
 $buildBat | Out-File -FilePath $batFile -Encoding ASCII
-$output = cmd /c $batFile 2>&1
+$output = cmd /c $batFile
 $exitCode = $LASTEXITCODE
 Remove-Item $batFile -Force -ErrorAction SilentlyContinue
 
@@ -301,6 +302,18 @@ if ($exitCode -ne 0 -or -not ($output -match "BUILD_OK")) {
 
 $dllInfo = Get-Item (Join-Path $outDir "jff.dll")
 Write-Host "[OK] jff.dll built successfully ($([math]::Round($dllInfo.Length/1KB)) KB)" -ForegroundColor Green
+
+$targetPspDirs = @("L:\psp\psp", "I:\Programas\Paint Shop Pro 7")
+foreach ($targetDir in $targetPspDirs) {
+    if (Test-Path $targetDir) {
+        try {
+            Copy-Item -Path (Join-Path $outDir "jff.dll") -Destination (Join-Path $targetDir "jff.dll") -Force -ErrorAction Stop
+            Write-Host "[OK] Copied jff.dll to $targetDir" -ForegroundColor Green
+        } catch {
+            Write-Host "[WARN] No se pudo copiar jff.dll a $targetDir (posiblemente bloqueado por psp.exe)." -ForegroundColor Yellow
+        }
+    }
+}
 
 # ---------------------------------------------------------------
 #  5) Done
