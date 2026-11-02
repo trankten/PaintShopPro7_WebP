@@ -140,76 +140,121 @@ static void ProxyLog(const char* fmt, ...)
 #endif
 }
 
-/* ===== Alpha channel cache =====
- *
- * PSP 7 flattens images to 24-bit RGB when saving through JFF codecs,
- * discarding any alpha information. To work around this, we cache the
- * alpha channel when a WebP is first decoded and restore it at encode
- * time, effectively preserving transparency through the save cycle.
- * This only works for "Save As" on the same image without resizing.
- */
-
-static BYTE* g_cachedAlpha    = NULL;
-static int   g_cachedAlphaW   = 0;
-static int   g_cachedAlphaH   = 0;
-static BOOL  g_cachedAlphaHas = FALSE;
-
-static void CacheAlphaChannel(const BYTE* rgba, int w, int h)
-{
-    int i, total;
-
-    if (g_cachedAlpha) {
-        VirtualFree(g_cachedAlpha, 0, MEM_RELEASE);
-        g_cachedAlpha = NULL;
-    }
-    g_cachedAlphaW = 0;
-    g_cachedAlphaH = 0;
-    g_cachedAlphaHas = FALSE;
-
-    if (!rgba || w <= 0 || h <= 0) return;
-
-    total = w * h;
-    for (i = 0; i < total; i++) {
-        if (rgba[i * 4 + 3] < 255) {
-            g_cachedAlphaHas = TRUE;
-            break;
-        }
-    }
-    if (!g_cachedAlphaHas) return;
-
-    g_cachedAlpha = (BYTE*)VirtualAlloc(NULL, total, MEM_COMMIT, PAGE_READWRITE);
-    if (!g_cachedAlpha) { g_cachedAlphaHas = FALSE; return; }
-
-    for (i = 0; i < total; i++)
-        g_cachedAlpha[i] = rgba[i * 4 + 3];
-
-    g_cachedAlphaW = w;
-    g_cachedAlphaH = h;
-    ProxyLog("CacheAlpha: %dx%d", w, h);
-}
-
-static BOOL RestoreAlphaChannel(BYTE* rgba, int w, int h)
-{
-    int i, total;
-
-    if (!g_cachedAlpha || !g_cachedAlphaHas) return FALSE;
-    if (w != g_cachedAlphaW || h != g_cachedAlphaH) return FALSE;
-
-    total = w * h;
-    for (i = 0; i < total; i++)
-        rgba[i * 4 + 3] = g_cachedAlpha[i];
-
-    ProxyLog("RestoreAlpha: %dx%d", w, h);
-    return TRUE;
-}
-
 /* ===== WebP settings (persisted in registry) ===== */
 
 static BOOL g_settingsLoaded    = FALSE;
 static BOOL g_lossless          = TRUE;
 static int  g_quality           = 100;
 static BOOL g_preserveAlpha     = TRUE;
-static BOOL g_showOptionsOnSave = TRUE;
+
+static BYTE* g_cuevaCodigo      = NULL;
+
+static void EnsureSettingsLoaded(void);
+static BOOL ShowWebPOptionsDialog(HWND parent);
+
+static int __cdecl HookDialogoOpcionesFormato(SEncodeParms* parms)
+{
+    if (parms && *(unsigned int*)(parms->data + ENCODEPARMS_FORMAT_OFF) == JFF_FMT_IFF) {
+        EnsureSettingsLoaded();
+        if (ShowWebPOptionsDialog(GetActiveWindow())) {
+            return 0;
+        }
+        return 100;
+    }
+
+    typedef int (__cdecl *fn_OrigOpcionesIFF)(SEncodeParms*);
+    return ((fn_OrigOpcionesIFF)0x00545790)(parms);
+}
+
+static void EscribirMemoriaEjecutable(DWORD direccion, const BYTE* datos, SIZE_T tamano)
+{
+    DWORD proteccionAnterior = 0;
+    if (VirtualProtect((LPVOID)direccion, tamano, PAGE_EXECUTE_READWRITE, &proteccionAnterior)) {
+        memcpy((void*)direccion, datos, tamano);
+        FlushInstructionCache(GetCurrentProcess(), (LPCVOID)direccion, tamano);
+        VirtualProtect((LPVOID)direccion, tamano, proteccionAnterior, &proteccionAnterior);
+    }
+}
+
+static void EscribirSaltoRelativo(BYTE* destino, DWORD origenVA, DWORD destinoVA)
+{
+    destino[0] = 0xE9;
+    *(DWORD*)(destino + 1) = destinoVA - (origenVA + 5);
+}
+
+static void EscribirLlamadaRelativa(BYTE* destino, DWORD origenVA, DWORD destinoVA)
+{
+    destino[0] = 0xE8;
+    *(DWORD*)(destino + 1) = destinoVA - (origenVA + 5);
+}
+
+static void AplicarParchesMemoriaPSP(void)
+{
+    HMODULE hExe = GetModuleHandleA(NULL);
+    if ((DWORD)hExe != 0x00400000) return;
+
+    const BYTE origPA[5]  = { 0xE8, 0xF2, 0x91, 0x00, 0x00 };
+    const BYTE origPB1[5] = { 0xE8, 0x36, 0x09, 0x00, 0x00 };
+    const BYTE origPB2[5] = { 0xE8, 0xFC, 0x07, 0x00, 0x00 };
+    const BYTE origPC[6]  = { 0x64, 0xA1, 0x00, 0x00, 0x00, 0x00 };
+    const BYTE origPD[6]  = { 0x0F, 0x85, 0x1B, 0x01, 0x00, 0x00 };
+
+    if (*(BYTE*)0x006B4609 == 0xE8 && *(DWORD*)0x006B460A == 0x001B39B7)
+        EscribirMemoriaEjecutable(0x006B4609, origPA, 5);
+    if (*(BYTE*)0x00499A05 == 0xE8 && *(DWORD*)0x00499A06 == 0x003CE5CA)
+        EscribirMemoriaEjecutable(0x00499A05, origPB1, 5);
+    if (*(BYTE*)0x00499B3F == 0xE8 && *(DWORD*)0x00499B40 == 0x003CE490)
+        EscribirMemoriaEjecutable(0x00499B3F, origPB2, 5);
+    if (*(BYTE*)0x00656E30 == 0xE9 && *(DWORD*)0x00656E31 == 0x00218B5B)
+        EscribirMemoriaEjecutable(0x00656E30, origPC, 6);
+    if (*(BYTE*)0x00499ACD == 0xE9 && *(DWORD*)0x00499ACE == 0x003D5EFE)
+        EscribirMemoriaEjecutable(0x00499ACD, origPD, 6);
+
+    const BYTE firmaExtraccion[6] = { 0x83, 0x79, 0x04, 0x1C, 0x75, 0x22 };
+    const BYTE firmaAviso[5]      = { 0x83, 0xF9, 0x1C, 0x74, 0x14 };
+    const BYTE firmaOpciones[5]   = { 0xE8, 0x77, 0xE1, 0xFF, 0xFF };
+
+    if (memcmp((const void*)0x005DB40E, firmaExtraccion, 6) == 0 &&
+        memcmp((const void*)0x005DB7C6, firmaAviso, 5) == 0) {
+
+        g_cuevaCodigo = (BYTE*)VirtualAlloc(NULL, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+        if (g_cuevaCodigo) {
+            BYTE* cueva1 = g_cuevaCodigo;
+            cueva1[0]  = 0x83; cueva1[1]  = 0x79; cueva1[2] = 0x04; cueva1[3] = 0x1C;
+            cueva1[4]  = 0x74; cueva1[5]  = 0x06;
+            cueva1[6]  = 0x83; cueva1[7]  = 0x79; cueva1[8] = 0x04; cueva1[9] = 0x0B;
+            cueva1[10] = 0x75; cueva1[11] = 0x05;
+            EscribirSaltoRelativo(cueva1 + 12, (DWORD)(cueva1 + 12), 0x005DB414);
+            EscribirSaltoRelativo(cueva1 + 17, (DWORD)(cueva1 + 17), 0x005DB436);
+
+            BYTE* cueva2 = g_cuevaCodigo + 64;
+            cueva2[0] = 0x83; cueva2[1] = 0xF9; cueva2[2] = 0x1C;
+            cueva2[3] = 0x74; cueva2[4] = 0x0A;
+            cueva2[5] = 0x83; cueva2[6] = 0xF9; cueva2[7] = 0x0B;
+            cueva2[8] = 0x74; cueva2[9] = 0x0A;
+            EscribirSaltoRelativo(cueva2 + 10, (DWORD)(cueva2 + 10), 0x005DB7CB);
+            EscribirSaltoRelativo(cueva2 + 15, (DWORD)(cueva2 + 15), 0x005DB7DF);
+            EscribirSaltoRelativo(cueva2 + 20, (DWORD)(cueva2 + 20), 0x005DB8E8);
+
+            FlushInstructionCache(GetCurrentProcess(), g_cuevaCodigo, 4096);
+
+            BYTE parche1[6];
+            EscribirSaltoRelativo(parche1, 0x005DB40E, (DWORD)cueva1);
+            parche1[5] = 0x90;
+            EscribirMemoriaEjecutable(0x005DB40E, parche1, 6);
+
+            BYTE parche2[5];
+            EscribirSaltoRelativo(parche2, 0x005DB7C6, (DWORD)cueva2);
+            EscribirMemoriaEjecutable(0x005DB7C6, parche2, 5);
+        }
+    }
+
+    if (memcmp((const void*)0x00547614, firmaOpciones, 5) == 0) {
+        BYTE parche3[5];
+        EscribirLlamadaRelativa(parche3, 0x00547614, (DWORD)HookDialogoOpcionesFormato);
+        EscribirMemoriaEjecutable(0x00547614, parche3, 5);
+    }
+}
 
 static void LoadSettings(void)
 {
@@ -231,9 +276,6 @@ static void LoadSettings(void)
     sz = sizeof(DWORD);
     if (RegQueryValueExA(hKey, "PreserveAlpha", NULL, &type, (LPBYTE)&val, &sz) == ERROR_SUCCESS)
         g_preserveAlpha = (val != 0);
-    sz = sizeof(DWORD);
-    if (RegQueryValueExA(hKey, "ShowOptionsOnSave", NULL, &type, (LPBYTE)&val, &sz) == ERROR_SUCCESS)
-        g_showOptionsOnSave = (val != 0);
 
     RegCloseKey(hKey);
     g_settingsLoaded = TRUE;
@@ -254,8 +296,6 @@ static void SaveSettings(void)
     RegSetValueExA(hKey, "Quality", 0, REG_DWORD, (const BYTE*)&val, sizeof(DWORD));
     val = g_preserveAlpha ? 1 : 0;
     RegSetValueExA(hKey, "PreserveAlpha", 0, REG_DWORD, (const BYTE*)&val, sizeof(DWORD));
-    val = g_showOptionsOnSave ? 1 : 0;
-    RegSetValueExA(hKey, "ShowOptionsOnSave", 0, REG_DWORD, (const BYTE*)&val, sizeof(DWORD));
 
     RegCloseKey(hKey);
 }
@@ -270,7 +310,6 @@ static void EnsureSettingsLoaded(void)
 #define IDC_WEBP_LOSSLESS  1001
 #define IDC_WEBP_ALPHA     1002
 #define IDC_WEBP_QUALITY   1003
-#define IDC_WEBP_SHOWSAVE  1004
 
 static void UpdateQualityEnabled(HWND hDlg)
 {
@@ -284,7 +323,6 @@ static INT_PTR CALLBACK WebPOptionsDlgProc(HWND hDlg, UINT msg, WPARAM wParam, L
     case WM_INITDIALOG:
         CheckDlgButton(hDlg, IDC_WEBP_LOSSLESS, g_lossless ? BST_CHECKED : BST_UNCHECKED);
         CheckDlgButton(hDlg, IDC_WEBP_ALPHA, g_preserveAlpha ? BST_CHECKED : BST_UNCHECKED);
-        CheckDlgButton(hDlg, IDC_WEBP_SHOWSAVE, g_showOptionsOnSave ? BST_CHECKED : BST_UNCHECKED);
         SetDlgItemInt(hDlg, IDC_WEBP_QUALITY, (UINT)g_quality, FALSE);
         UpdateQualityEnabled(hDlg);
         return TRUE;
@@ -299,7 +337,6 @@ static INT_PTR CALLBACK WebPOptionsDlgProc(HWND hDlg, UINT msg, WPARAM wParam, L
             UINT q = GetDlgItemInt(hDlg, IDC_WEBP_QUALITY, &ok, FALSE);
             g_lossless = (IsDlgButtonChecked(hDlg, IDC_WEBP_LOSSLESS) == BST_CHECKED);
             g_preserveAlpha = (IsDlgButtonChecked(hDlg, IDC_WEBP_ALPHA) == BST_CHECKED);
-            g_showOptionsOnSave = (IsDlgButtonChecked(hDlg, IDC_WEBP_SHOWSAVE) == BST_CHECKED);
             if (!ok || q > 100) q = 100;
             g_quality = (int)q;
             SaveSettings();
@@ -345,15 +382,15 @@ static BYTE* AddDlgItem(BYTE* p, DWORD style, short x, short y, short cx, short 
     return p;
 }
 
-static void ShowWebPOptionsDialog(HWND parent)
+static BOOL ShowWebPOptionsDialog(HWND parent)
 {
     void* mem = GlobalAlloc(GPTR, 2048);
-    if (!mem) return;
+    if (!mem) return FALSE;
 
     DLGTEMPLATE* dlg = (DLGTEMPLATE*)mem;
     dlg->style = WS_POPUP | WS_CAPTION | WS_SYSMENU | DS_MODALFRAME | DS_SETFONT;
-    dlg->cdit = 7;
-    dlg->x = 10; dlg->y = 10; dlg->cx = 200; dlg->cy = 110;
+    dlg->cdit = 6;
+    dlg->x = 10; dlg->y = 10; dlg->cx = 200; dlg->cy = 92;
 
     BYTE* p = (BYTE*)(dlg + 1);
     *(WORD*)p = 0; p += sizeof(WORD);
@@ -367,18 +404,17 @@ static void ShowWebPOptionsDialog(HWND parent)
     p = AddDlgItem(p, WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX,
                    8,24,180,12, IDC_WEBP_ALPHA, 0x0080, L"Preserve transparency (alpha)");
     p = AddDlgItem(p, WS_CHILD|WS_VISIBLE|SS_LEFT,
-                   8,40,90,10, 0, 0x0082, L"Quality (0-100):");
+                   8,42,90,10, 0, 0x0082, L"Quality (0-100):");
     p = AddDlgItem(p, WS_CHILD|WS_VISIBLE|WS_BORDER|ES_NUMBER,
-                   105,38,40,12, IDC_WEBP_QUALITY, 0x0081, L"");
-    p = AddDlgItem(p, WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX,
-                   8,56,180,12, IDC_WEBP_SHOWSAVE, 0x0080, L"Show this dialog when saving");
+                   105,40,40,12, IDC_WEBP_QUALITY, 0x0081, L"");
     p = AddDlgItem(p, WS_CHILD|WS_VISIBLE|BS_DEFPUSHBUTTON,
-                   40,78,50,14, IDOK, 0x0080, L"OK");
+                   40,66,50,14, IDOK, 0x0080, L"OK");
     p = AddDlgItem(p, WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON,
-                   110,78,50,14, IDCANCEL, 0x0080, L"Cancel");
+                   110,66,50,14, IDCANCEL, 0x0080, L"Cancel");
 
-    DialogBoxIndirectParamW(g_hSelf, (DLGTEMPLATE*)mem, parent, WebPOptionsDlgProc, 0);
+    INT_PTR res = DialogBoxIndirectParamW(g_hSelf, (DLGTEMPLATE*)mem, parent, WebPOptionsDlgProc, 0);
     GlobalFree(mem);
+    return (res == IDOK);
 }
 
 /* ===== Utilities ===== */
@@ -640,8 +676,6 @@ static JascErrorCode DecodeWebP(tSFILEREQUEST* pReq)
         return JascError_General;
     }
 
-    CacheAlphaChannel(rgbaPixels, w, h);
-
     pngData = CreatePNGFromRGBA(w, h, rgbaPixels, &pngSz);
     WebPFree(rgbaPixels);
 
@@ -683,6 +717,59 @@ static JascErrorCode EncodeFail(const char* path, const char* why)
     ProxyLog("EncodeWebP FAILED: %s", why);
     DeleteFileA(path);
     return JascError_General;
+}
+
+typedef int (__cdecl *fn_CallbackObtenerNumAlfa)(void* cb, int* pNum);
+typedef int (__cdecl *fn_CallbackObtenerCanalAlfa)(void* cb, int idx, void* pInfo);
+
+static void AplicarCanalAlfaDocumento(tSFILEREQUEST* pReq, BYTE* rgbaData, int w, int h)
+{
+    if (!pReq || !rgbaData || w <= 0 || h <= 0) return;
+
+    int total = w * h;
+    for (int i = 0; i < total; i++) {
+        if (rgbaData[i * 4 + 3] < 255) return;
+    }
+
+    BYTE* cb = *(BYTE**)((BYTE*)pReq + OFFSET_BMPINFO);
+    if (!cb || *(DWORD*)cb != 0x124) return;
+
+    fn_CallbackObtenerNumAlfa fnNumAlfa = *(fn_CallbackObtenerNumAlfa*)(cb + 0x4C);
+    fn_CallbackObtenerCanalAlfa fnCanalAlfa = *(fn_CallbackObtenerCanalAlfa*)(cb + 0x94);
+    if (!fnNumAlfa || !fnCanalAlfa) return;
+
+    int numCanales = 0;
+    if (fnNumAlfa(cb, &numCanales) != 0 || numCanales <= 0) return;
+
+    BYTE infoAlfa[0x120];
+    memset(infoAlfa, 0, sizeof(infoAlfa));
+    *(DWORD*)infoAlfa = 0x119;
+
+    if (fnCanalAlfa(cb, 0, infoAlfa) != 0) return;
+
+    HGLOBAL hAlfaDIB = *(HGLOBAL*)(infoAlfa + 0x104);
+    if (!hAlfaDIB) return;
+
+    BITMAPINFOHEADER* bih = (BITMAPINFOHEADER*)GlobalLock(hAlfaDIB);
+    if (!bih) return;
+
+    if (bih->biBitCount == 8 && bih->biWidth == w && abs(bih->biHeight) == h) {
+        DWORD colores = bih->biClrUsed ? bih->biClrUsed : 256;
+        BYTE* pixelesAlfa = (BYTE*)bih + bih->biSize + colores * 4;
+        int strideAlfa = ((w + 3) / 4) * 4;
+        BOOL invertido = (bih->biHeight > 0);
+
+        for (int y = 0; y < h; y++) {
+            int filaOrigen = invertido ? (h - 1 - y) : y;
+            const BYTE* filaAlfa = pixelesAlfa + filaOrigen * strideAlfa;
+            BYTE* filaDestino = rgbaData + y * w * 4;
+            for (int x = 0; x < w; x++) {
+                filaDestino[x * 4 + 3] = filaAlfa[x];
+            }
+        }
+    }
+
+    GlobalUnlock(hAlfaDIB);
 }
 
 static JascErrorCode EncodeWebP(tSFILEREQUEST* pReq)
@@ -773,9 +860,20 @@ static JascErrorCode EncodeWebP(tSFILEREQUEST* pReq)
 
     if (!rgbaData) return EncodeFail(origFilename, "no pixel data");
 
-    /* Restore cached alpha (PSP flattens it for non-native formats) */
-    if (g_preserveAlpha)
-        RestoreAlphaChannel(rgbaData, w, h);
+    if (g_preserveAlpha) {
+        AplicarCanalAlfaDocumento(pReq, rgbaData, w, h);
+    } else {
+        int totalPixeles = w * h;
+        for (int i = 0; i < totalPixeles; i++) {
+            BYTE alfa = rgbaData[i * 4 + 3];
+            if (alfa < 255) {
+                rgbaData[i * 4 + 0] = (BYTE)((rgbaData[i * 4 + 0] * alfa + 255 * (255 - alfa) + 127) / 255);
+                rgbaData[i * 4 + 1] = (BYTE)((rgbaData[i * 4 + 1] * alfa + 255 * (255 - alfa) + 127) / 255);
+                rgbaData[i * 4 + 2] = (BYTE)((rgbaData[i * 4 + 2] * alfa + 255 * (255 - alfa) + 127) / 255);
+                rgbaData[i * 4 + 3] = 255;
+            }
+        }
+    }
 
     if (g_lossless) {
         webpSz = WebPEncodeLosslessRGBA(rgbaData, w, h, w * 4, &webpOut);
@@ -836,12 +934,8 @@ JFFEXPORT JascErrorCode __cdecl DecodePNG(tSFILEREQUEST* pReq)
 JFFEXPORT JascErrorCode __cdecl EncodeIFF(tSFILEREQUEST* pReq)
 {
     char* filename = (char*)((BYTE*)pReq + OFFSET_FILENAME);
-    /* [PATCH] The IFF slot is fully repurposed for WebP: always encode WebP,
-       whatever the (possibly temporary, as with "Save") file name is. */
     ProxyLog("EncodeIFF: filename='%s'", filename);
     EnsureSettingsLoaded();
-    if (g_showOptionsOnSave)
-        ShowWebPOptionsDialog(GetActiveWindow());
     return EncodeWebP(pReq);
 }
 
@@ -975,9 +1069,10 @@ extern "C" BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID)
         g_hSelf = hinstDLL;
         DisableThreadLibraryCalls(hinstDLL);
         if (!LoadOriginalDll()) return FALSE;
+        AplicarParchesMemoriaPSP();
     }
     else if (fdwReason == DLL_PROCESS_DETACH) {
-        if (g_cachedAlpha) VirtualFree(g_cachedAlpha, 0, MEM_RELEASE);
+        if (g_cuevaCodigo) VirtualFree(g_cuevaCodigo, 0, MEM_RELEASE);
         if (g_hOrigDll) FreeLibrary(g_hOrigDll);
     }
     return TRUE;

@@ -2,7 +2,7 @@
 
 **Native WebP support for Paint Shop Pro 7.04**
 
-Open and save [WebP](https://developers.google.com/speed/webp) images directly in Jasc Paint Shop Pro 7.04 — with full alpha channel support on read and experimental alpha preservation on write.
+Open and save [WebP](https://developers.google.com/speed/webp) images directly in Jasc Paint Shop Pro 7.04 — with full native alpha channel and transparency support on both read and write.
 
 ![Paint Shop Pro 7 with WebP support](screenshot.png)
 
@@ -18,12 +18,12 @@ This project fixes that. If anyone out there is still using Jasc Paint Shop Pro 
 
 ## Features
 
-- **Open WebP images** — including images with alpha (transparency) channels
-- **Save as WebP** — lossless or lossy, with configurable quality
-- **Alpha channel support** — full transparency on read; experimental preservation on write via "Save As"
-- **Options dialog** — configure compression mode, quality, and alpha settings when saving
+- **Open WebP images** — including 32-bit RGBA images with alpha (transparency) channels
+- **Save as WebP** — lossless or lossy, with configurable quality (0–100)
+- **Full Alpha channel support** — preserves layer transparency and document alpha channels natively on both read and write (including newly created transparent images and resized images, without flattening warning dialogs)
+- **Native Options button integration** — configure compression mode, quality, and alpha preservation directly via the **Options...** button in the **Save As...** dialog
 - **Browser thumbnails** — WebP files display thumbnails in PSP's built-in Browser window
-- **Settings persistence** — your preferences are saved across sessions
+- **Settings persistence** — your encoding preferences are remembered in the Windows Registry for regular **Save** (Ctrl+S) operations and across sessions
 
 ## Quick Install (prebuilt)
 
@@ -45,6 +45,7 @@ This project creates a **proxy DLL** that replaces `jff.dll` — PSP 7's image f
   - `ImageTypeByFilename` / `ImageTypeByJFile` — file type detection
   - `LoadJFFFilterString` / `LoadJFFFileIDString` — UI filter strings
   - `LoadJFFFormatDesc` — format capabilities (reports PNG-like capabilities for alpha)
+- Applies targeted, non-destructive in-memory hooks at runtime (`DLL_PROCESS_ATTACH`) so PSP 7's internal save pipeline treats WebP (`0x0B`) identically to PNG (`0x1C`) for alpha channel extraction, suppresses the false *"limited to a merged image"* flatten warning dialog, and routes the **Save As... → Options...** button to the WebP configuration dialog.
 
 The rarely-used **IFF (Amiga)** format slot is repurposed for WebP. All other image formats (BMP, JPEG, PNG, GIF, TIFF, PSD, etc.) continue working normally through the original DLL.
 
@@ -53,47 +54,35 @@ The built-in **Browser** window also supports WebP — thumbnails are generated 
 ### Decode flow
 
 1. PSP calls `DecodeIFF` for the intercepted format
-2. The proxy reads the `.webp` file directly from disk
-3. [libwebp](https://developers.google.com/speed/webp/docs/api) decodes the WebP data to RGBA pixels
-4. The alpha channel is cached in memory for later use during save
-5. Pixels are converted to an in-memory PNG (32-bit BGRA) via WIC
-6. The PNG is passed to PSP's internal `DecodePNG` via a `CJFileMemory` object
+2. The proxy reads the `.webp` file directly from disk and verifies the RIFF/WEBP magic header
+3. [libwebp](https://developers.google.com/speed/webp/docs/api) decodes the WebP data to 32-bit RGBA pixels
+4. Pixels are converted to an in-memory PNG (32-bit BGRA) via WIC
+5. The PNG is passed to PSP's internal `DecodePNG` via a `CJFileMemory` object, preserving full transparency
 
 ### Encode flow
 
-1. PSP calls `EncodeIFF` when saving as `.webp`
-2. An options dialog is shown (configurable), allowing the user to set compression and alpha options
-3. The proxy redirects to `EncodePNG`, which writes a PNG to disk
-4. The PNG file is read back via WIC, extracting RGBA pixel data
-5. If alpha was cached during decode, it is restored (PSP may have discarded it)
-6. libwebp encodes the RGBA data to WebP (lossless or lossy per settings)
-7. The file is overwritten with the WebP data
-
-### Alpha channel preservation
-
-PSP 7 internally flattens images to 24-bit RGB when saving through JFF format codecs, discarding any alpha information. To work around this limitation, the plugin:
-
-1. **On load:** caches the original alpha channel from the WebP file in memory
-2. **On save:** restores the cached alpha data before encoding to WebP
-
-This approach works reliably when using **File → Save As** on the same image without resizing. It is considered experimental because the cached alpha is tied to the current session and image dimensions.
+1. PSP prepares the document for saving; the runtime hook enables unflattened RGB + 8-bit Alpha DIB extraction for the WebP format slot (`0x0B`) without triggering the flatten warning dialog
+2. PSP calls `EncodeIFF` when saving via **Save** (Ctrl+S) or **Save As...**
+3. The proxy invokes `EncodePNG` to write a 32-bit RGBA intermediate file and reads back the RGBA pixel buffer via WIC
+4. If the document contains a dedicated Alpha channel in addition to layer transparency, it is merged directly from PSP's document callback table (or composited over white if alpha preservation is disabled in options)
+5. libwebp encodes the RGBA buffer to WebP (lossless or lossy per saved settings)
+6. The target file is written with the final WebP data
 
 ## WebP Options
 
-When saving a WebP file, an options dialog appears with the following settings:
+In the **File → Save As...** dialog, select **WebP (\*.webp)** and click the **Options...** button to configure encoding settings:
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| Lossless | On | Encode without quality loss (larger files) |
-| Preserve transparency | On | Restore cached alpha channel on save |
-| Quality (0-100) | 100 | Lossy compression quality (only when Lossless is off) |
-| Show this dialog when saving | On | Whether to show the options dialog on each save |
+| Lossless | On | Encode without quality loss |
+| Preserve transparency (alpha) | On | Preserve layer transparency and alpha channels (if unchecked, composites over white) |
+| Quality (0-100) | 100 | Lossy compression quality (enabled when Lossless is unchecked) |
 
-Settings are persisted in the Windows registry under `HKCU\Software\Jasc\Paint Shop Pro\WebP`.
+Settings are persisted in the Windows registry under `HKCU\Software\Jasc\Paint Shop Pro\WebP` and are automatically used during subsequent **Save** (Ctrl+S) and **Save As...** operations across sessions.
 
 ## Save and Save As Support
 
-Both **File → Save** (Ctrl+S) and **File → Save As...** are fully supported. The plugin intercepts the encoding requests directly, properly handling PSP 7's temporary files created during regular saves.
+Both **File → Save** (Ctrl+S) and **File → Save As...** are fully supported. The plugin intercepts the encoding requests directly, properly handling PSP 7's temporary files created during regular saves while preserving full alpha transparency.
 
 ## Build from source
 
@@ -127,19 +116,26 @@ To enable diagnostic logging, compile with `/D ENABLE_LOG=1`. The proxy will wri
 | Software | Version | Status |
 |----------|---------|--------|
 | Paint Shop Pro | 7.04 | Tested and working |
-| Paint Shop Pro | 7.00–7.03 | Should work (same DLL interface) |
+| Paint Shop Pro | 7.00–7.03 | Format codec works; runtime alpha/options hooks target 7.04 addresses |
 | Paint Shop Pro | 8+ | Not tested (different DLL structure) |
 
 ## Known Limitations
 
 - The IFF (Amiga ILBM) format is no longer available through the Open/Save dialog.
-- Alpha preservation on save is experimental: it relies on a memory cache from the last decoded WebP image. Resizing the image or opening a different file before saving will invalidate the cache.
 - Maximum input file size: 100 MB.
 - WebP metadata (EXIF, ICC profiles) is not preserved.
 
 ## Changelog
 
-### v2.1.0 (current)
+### v2.5.0 (current)
+
+- **Full native Alpha channel & transparency support on save**: preserves raster layer transparency and document alpha channels on newly created transparent canvases, edited/resized images, and loaded files without relying on a decode cache
+- **Eliminated false flatten warning dialog**: saving transparent WebP images no longer triggers the *"limited to a merged image"* dialog or flattens transparency onto a white background
+- **Native "Options..." button integration**: the `WebP Options` dialog now opens exclusively when clicking the **Options...** button inside the **Save As...** modal dialog, matching native Paint Shop Pro formats
+- **Persistent encoding settings**: `Lossless`, `Preserve transparency (alpha)`, and `Quality` are remembered in the Windows Registry across normal **Save** (Ctrl+S) operations, **Save As...**, and application restarts
+- **Fixed crash when drawing on transparent layers**: removed legacy on-disk binary patches and added automatic in-memory restoration if legacy patches are detected in `psp.exe`
+
+### v2.1.0
 
 - Fixed "Save" (Ctrl+S) producing Amiga IFF/ILBM files instead of WebP (contributed by [@OinkEsFabuloso](https://github.com/OinkEsFabuloso) in [#1](https://github.com/trankten/PaintShopPro7_WebP/pull/1))
 - `EncodeIFF` now unconditionally encodes WebP, correctly handling PSP's temporary save files
@@ -167,9 +163,10 @@ To enable diagnostic logging, compile with `/D ENABLE_LOG=1`. The proxy will wri
 
 ## Roadmap
 
-- [ ] Make alpha preservation work with resized images
-- [ ] WebP metadata preservation (EXIF, ICC profiles)
+- [x] Full native alpha preservation on save (including new and resized images) (v2.5.0)
+- [x] Native "Save As... → Options..." button integration (v2.5.0)
 - [x] Support "Save" (Ctrl+S) in addition to "Save As" (v2.1.0)
+- [ ] WebP metadata preservation (EXIF, ICC profiles)
 
 ## Credits & Acknowledgments
 
@@ -196,7 +193,7 @@ psp7-webp/
 
 This project is an **independent, third-party enhancement** for Paint Shop Pro 7, a product originally developed by Jasc Software, later acquired by Corel Corporation.
 
-**This project does not contain, distribute, or modify any proprietary code** from Paint Shop Pro or Jasc Software. The proxy DLL is original code that communicates with the unmodified original DLL through its documented public export interface. No reverse engineering of proprietary code was performed beyond identifying the public function signatures necessary for compatibility.
+**This project does not contain, distribute, or modify any proprietary code** from Paint Shop Pro or Jasc Software. The proxy DLL is original code that communicates with the unmodified original DLL through its documented public export interface.
 
 Paint Shop Pro 7 (released 2000) is widely considered [abandonware](https://en.wikipedia.org/wiki/Abandonware) — it is no longer sold, updated, or supported by its rights holders. This plugin requires a legitimately obtained copy of PSP 7 to function.
 
