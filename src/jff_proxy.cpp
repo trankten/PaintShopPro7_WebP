@@ -20,6 +20,8 @@
  *     decoder if the file really is a PNG) instead of always using PNG.
  *  4. EncodeWebP returns an error (and removes the intermediate file)
  *     instead of reporting success when something fails.
+ *  5. "Paste As New Image" keeps the transparency of a PNG on the clipboard
+ *     (see the section before DllMain).
  */
 
 extern "C" {
@@ -1063,6 +1065,299 @@ static BOOL LoadOriginalDll(void)
     return TRUE;
 }
 
+/* ===== Paste As New Image keeping transparency =====
+ *
+ * psp.exe only reads CF_DIB when pasting, and Windows gives it a 24-bit
+ * copy with the alpha already flattened. Apps such as Firefox also put a
+ * real RGBA "PNG" on the clipboard. When that PNG has real transparency,
+ * the "Paste As New Image" command writes it to a temporary file and opens
+ * it through PSP's own OpenDocumentFile, so the transparency is imported
+ * exactly as with File > Open. The temporary file is deleted right after
+ * and is kept out of the recent files list. In every other case (no PNG,
+ * opaque PNG, any failure) the original command runs untouched.
+ *
+ * Addresses are for psp.exe 7.04 (image base 0x00400000) and are checked
+ * before patching:
+ *   0x00896794  vtable slot holding the "Paste As New Image" handler
+ *   0x006DF960  that handler (thiscall, one stack argument, RET 4)
+ *   0x0069F740  PSP's override of CWinApp::OpenDocumentFile (thiscall, RET 4)
+ *   0x00893760  slot of that override in the application's vtable
+ *   0x00893764  next slot: CWinApp::AddToRecentFileList (MFC thunk 0x00829D20)
+ *   0x0082907E  import thunk for MFC's AfxGetModuleState
+ */
+
+#define PASTE_NEWIMAGE_SLOT    0x00896794
+#define PASTE_NEWIMAGE_ORIG    0x006DF960
+#define PSP_APP_OPENDOC        0x0069F740
+#define PSP_APP_OPENDOC_SLOT   0x00893760
+#define PSP_APP_ADDRECENT_SLOT 0x00893764
+#define PSP_APP_ADDRECENT_ORIG 0x00829D20
+#define PSP_AFXGETMODULESTATE  0x0082907E
+
+typedef int   (__fastcall *fn_PasteHandler)(void* pThis, void* edx, void* arg);
+typedef void* (__stdcall  *fn_AfxGetModuleState)(void);
+typedef void* (__fastcall *fn_OpenDocFile)(void* pApp, void* edx, const char* path);
+typedef void  (__fastcall *fn_AddRecent)(void* pApp, void* edx, const char* path);
+
+/* Set only while our own paste opens its temporary file. */
+static BOOL g_suppressRecentFile = FALSE;
+
+static void __fastcall HookAddToRecentFileList(void* pApp, void* edx, const char* path)
+{
+    if (g_suppressRecentFile) return;
+    ((fn_AddRecent)PSP_APP_ADDRECENT_ORIG)(pApp, edx, path);
+}
+
+/* TRUE if the PNG decodes and at least one pixel is not fully opaque. */
+static BOOL PngHasTransparency(const BYTE* png, SIZE_T pngSz)
+{
+    IWICImagingFactory* factory = NULL;
+    IWICStream* wstream = NULL;
+    IWICBitmapDecoder* decoder = NULL;
+    IWICBitmapFrameDecode* frame = NULL;
+    IWICFormatConverter* conv = NULL;
+    BYTE* row = NULL;
+    UINT w = 0, h = 0, x, y;
+    HRESULT hr;
+    BOOL comInit = FALSE;
+    BOOL found = FALSE;
+
+    hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+    comInit = SUCCEEDED(hr);
+    if (FAILED(hr) && hr != RPC_E_CHANGED_MODE) return FALSE;
+
+    hr = CoCreateInstance(CLSID_WICImagingFactory, NULL, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&factory));
+    if (FAILED(hr)) goto done;
+    hr = factory->CreateStream(&wstream);
+    if (FAILED(hr)) goto done;
+    hr = wstream->InitializeFromMemory((BYTE*)png, (DWORD)pngSz);
+    if (FAILED(hr)) goto done;
+    hr = factory->CreateDecoderFromStream(wstream, NULL, WICDecodeMetadataCacheOnLoad, &decoder);
+    if (FAILED(hr)) goto done;
+    hr = decoder->GetFrame(0, &frame);
+    if (FAILED(hr)) goto done;
+    hr = frame->GetSize(&w, &h);
+    if (FAILED(hr) || w == 0 || h == 0 || w > 65536 || h > 65536) goto done;
+    hr = factory->CreateFormatConverter(&conv);
+    if (FAILED(hr)) goto done;
+    hr = conv->Initialize(frame, GUID_WICPixelFormat32bppBGRA, WICBitmapDitherTypeNone,
+                          NULL, 0.0, WICBitmapPaletteTypeCustom);
+    if (FAILED(hr)) goto done;
+
+    row = (BYTE*)malloc((size_t)w * 4);
+    if (!row) goto done;
+    for (y = 0; y < h && !found; y++) {
+        WICRect rc;
+        rc.X = 0; rc.Y = (INT)y; rc.Width = (INT)w; rc.Height = 1;
+        if (FAILED(conv->CopyPixels(&rc, w * 4, w * 4, row))) break;
+        for (x = 0; x < w; x++) {
+            if (row[x * 4 + 3] != 255) { found = TRUE; break; }
+        }
+    }
+
+done:
+    if (row) free(row);
+    if (conv) conv->Release();
+    if (frame) frame->Release();
+    if (decoder) decoder->Release();
+    if (wstream) wstream->Release();
+    if (factory) factory->Release();
+    if (comInit) CoUninitialize();
+    return found;
+}
+
+/* Copies the clipboard's "PNG" format into a malloc'ed buffer (NULL if absent). */
+static BYTE* ReadClipboardPng(SIZE_T* outSz)
+{
+    UINT fmt = RegisterClipboardFormatA("PNG");
+    HANDLE h;
+    const BYTE* p;
+    SIZE_T sz;
+    BYTE* copy = NULL;
+
+    *outSz = 0;
+    if (!fmt || !IsClipboardFormatAvailable(fmt)) return NULL;
+    if (!OpenClipboard(NULL)) return NULL;
+    h = GetClipboardData(fmt);
+    if (h) {
+        sz = GlobalSize(h);
+        p = (const BYTE*)GlobalLock(h);
+        if (p && sz >= 33 && sz <= 0x20000000 && memcmp(p, "\x89PNG\r\n\x1a\n", 8) == 0) {
+            copy = (BYTE*)malloc(sz);
+            if (copy) { memcpy(copy, p, sz); *outSz = sz; }
+        }
+        if (p) GlobalUnlock(h);
+    }
+    CloseClipboard();
+    return copy;
+}
+
+/* Deletes a file made by WriteTempPng and its two folders (each one is only
+ * removed if it is empty, so another running PSP is never affected). */
+static void RemoveTempPng(const char* path)
+{
+    char buf[MAX_PATH];
+    char* slash;
+
+    strncpy(buf, path, MAX_PATH - 1);
+    buf[MAX_PATH - 1] = 0;
+    if (!DeleteFileA(buf) && GetLastError() != ERROR_FILE_NOT_FOUND)
+        ProxyLog("[PASTE] could not delete %s (error %lu)", buf, GetLastError());
+    slash = strrchr(buf, '\\');
+    if (slash) { *slash = 0; RemoveDirectoryA(buf); }     /* <random> folder */
+    slash = strrchr(buf, '\\');
+    if (slash) { *slash = 0; RemoveDirectoryA(buf); }     /* psp7_paste folder */
+}
+
+/* Writes the PNG to %TEMP%\psp7_paste\<random>\Pasted image.png. The random
+ * folder keeps concurrent pastes apart; the fixed file name is what PSP shows
+ * as the document title. */
+static BOOL WriteTempPng(const BYTE* data, SIZE_T sz, char* outPath, size_t outLen)
+{
+    char root[MAX_PATH], sub[MAX_PATH];
+    LARGE_INTEGER qpc;
+    HANDLE hf;
+    DWORD written = 0;
+    DWORD n = GetTempPathA(MAX_PATH, root);
+
+    if (n == 0 || n > MAX_PATH - 64) return FALSE;
+    strcat(root, "psp7_paste\\");
+    CreateDirectoryA(root, NULL);
+    QueryPerformanceCounter(&qpc);
+    _snprintf(sub, sizeof(sub), "%s%08lX%08lX%04lX\\", root,
+              GetCurrentProcessId(), (unsigned long)qpc.LowPart, GetTickCount() & 0xFFFF);
+    sub[sizeof(sub) - 1] = 0;
+    if (!CreateDirectoryA(sub, NULL)) { RemoveDirectoryA(root); return FALSE; }
+    _snprintf(outPath, outLen, "%sPasted image.png", sub);
+    outPath[outLen - 1] = 0;
+
+    hf = CreateFileA(outPath, GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hf == INVALID_HANDLE_VALUE) {
+        RemoveDirectoryA(sub);
+        RemoveDirectoryA(root);
+        return FALSE;
+    }
+    if (!WriteFile(hf, data, (DWORD)sz, &written, NULL) || written != (DWORD)sz) {
+        CloseHandle(hf);
+        RemoveTempPng(outPath);
+        return FALSE;
+    }
+    CloseHandle(hf);
+    return TRUE;
+}
+
+/* The CWinApp object, validated by checking that its vtable holds PSP's
+ * OpenDocumentFile override. NULL if anything looks different. */
+static void* GetPspApp(void)
+{
+    void* app = NULL;
+    __try {
+        void* state = ((fn_AfxGetModuleState)PSP_AFXGETMODULESTATE)();
+        if (state) {
+            void* cand = *(void**)((BYTE*)state + 4);
+            if (cand) {
+                const DWORD* vt = *(const DWORD**)cand;
+                int i;
+                for (i = 0; i < 96; i++) {
+                    if (vt[i] == PSP_APP_OPENDOC) { app = cand; break; }
+                }
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        app = NULL;
+    }
+    return app;
+}
+
+static void* CallOpenDocumentFile(void* app, const char* path)
+{
+    void* doc = NULL;
+    __try {
+        doc = ((fn_OpenDocFile)PSP_APP_OPENDOC)(app, NULL, path);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        doc = NULL;
+    }
+    return doc;
+}
+
+static BOOL TryPasteAlphaAsNewImage(void)
+{
+    SIZE_T sz = 0;
+    BYTE* png;
+    char path[MAX_PATH];
+    void* app;
+    void* doc = NULL;
+
+    png = ReadClipboardPng(&sz);
+    if (!png) return FALSE;
+    if (!PngHasTransparency(png, sz)) {
+        ProxyLog("[PASTE] clipboard PNG (%u bytes) has no transparency -> original paste", (unsigned)sz);
+        free(png);
+        return FALSE;
+    }
+    ProxyLog("[PASTE] clipboard PNG with real alpha (%u bytes)", (unsigned)sz);
+    if (!WriteTempPng(png, sz, path, sizeof(path))) {
+        ProxyLog("[PASTE] cannot write the temporary PNG -> original paste");
+        free(png);
+        return FALSE;
+    }
+    free(png);
+
+    app = GetPspApp();
+    if (!app) {
+        ProxyLog("[PASTE] application object not found -> original paste");
+    } else {
+        ProxyLog("[PASTE] opening %s through OpenDocumentFile (app=%p)", path, app);
+        g_suppressRecentFile = TRUE;
+        doc = CallOpenDocumentFile(app, path);
+        g_suppressRecentFile = FALSE;
+        ProxyLog("[PASTE] OpenDocumentFile returned %p", doc);
+    }
+
+    RemoveTempPng(path);
+    return doc != NULL;
+}
+
+static int __fastcall HookPasteNewImage(void* pThis, void* edx, void* arg)
+{
+    static BOOL busy = FALSE;
+    if (!busy) {
+        BOOL done;
+        busy = TRUE;
+        done = TryPasteAlphaAsNewImage();
+        busy = FALSE;
+        if (done) return 0;
+    }
+    return ((fn_PasteHandler)PASTE_NEWIMAGE_ORIG)(pThis, edx, arg);
+}
+
+static void InstallPasteAlphaHook(void)
+{
+    DWORD hook;
+
+    if ((DWORD)GetModuleHandleA(NULL) != 0x00400000) return;
+    if (*(DWORD*)PASTE_NEWIMAGE_SLOT != PASTE_NEWIMAGE_ORIG ||
+        *(DWORD*)PSP_APP_OPENDOC_SLOT != PSP_APP_OPENDOC ||
+        *(WORD*)PSP_AFXGETMODULESTATE != 0x25FF) {
+        ProxyLog("[PASTE] expected bytes not found, Paste As New Image NOT hooked");
+        return;
+    }
+
+    /* Keep the temporary file out of the recent files list. If that slot
+     * is not what we expect the paste still works, it just leaves an entry. */
+    if (*(DWORD*)PSP_APP_ADDRECENT_SLOT == PSP_APP_ADDRECENT_ORIG) {
+        hook = (DWORD)(DWORD_PTR)HookAddToRecentFileList;
+        EscribirMemoriaEjecutable(PSP_APP_ADDRECENT_SLOT, (const BYTE*)&hook, 4);
+        ProxyLog("[PASTE] AddToRecentFileList hooked (slot 0x%08X)", (unsigned)PSP_APP_ADDRECENT_SLOT);
+    } else {
+        ProxyLog("[PASTE] AddToRecentFileList slot differs, recent files list NOT protected");
+    }
+
+    hook = (DWORD)(DWORD_PTR)HookPasteNewImage;
+    EscribirMemoriaEjecutable(PASTE_NEWIMAGE_SLOT, (const BYTE*)&hook, 4);
+    ProxyLog("[PASTE] Paste As New Image hooked (slot 0x%08X)", (unsigned)PASTE_NEWIMAGE_SLOT);
+}
+
 extern "C" BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID)
 {
     if (fdwReason == DLL_PROCESS_ATTACH) {
@@ -1070,6 +1365,7 @@ extern "C" BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID)
         DisableThreadLibraryCalls(hinstDLL);
         if (!LoadOriginalDll()) return FALSE;
         AplicarParchesMemoriaPSP();
+        InstallPasteAlphaHook();
     }
     else if (fdwReason == DLL_PROCESS_DETACH) {
         if (g_cuevaCodigo) VirtualFree(g_cuevaCodigo, 0, MEM_RELEASE);
