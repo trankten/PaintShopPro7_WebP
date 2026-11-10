@@ -25,6 +25,9 @@ This project fixes that. If anyone out there is still using Jasc Paint Shop Pro 
 - **Browser thumbnails** — WebP files display thumbnails in PSP's built-in Browser window
 - **Settings persistence** — your encoding preferences are remembered in the Windows Registry for regular **Save** (Ctrl+S) operations and across sessions
 
+**Non-WebP fix**:
+- **Paste with transparency** — This is a fix for a bug that PSP 7 has had since forever: `Edit` > `Paste` > `Paste As New Image` now keeps the transparency of images copied from other applications (for [example](https://developers.google.com/speed/webp/gallery2) a web browser). Previously, PSP 7 only read the opaque bitmap Windows provides, so transparent areas were pasted as black. Now, alpha transparency is kept and the new image is shown as expected. Please note: `Paste As New Layer` and `Paste As Transparent Selection` are not affected by this fix, so they still paste the flattened bitmap.
+
 ## Quick Install (prebuilt)
 
 1. Go to the PSP 7 installation directory (where `psp.exe` lives)
@@ -46,10 +49,12 @@ This project creates a **proxy DLL** that replaces `jff.dll` — PSP 7's image f
   - `LoadJFFFilterString` / `LoadJFFFileIDString` — UI filter strings
   - `LoadJFFFormatDesc` — format capabilities (reports PNG-like capabilities for alpha)
 - Applies targeted, non-destructive in-memory hooks at runtime (`DLL_PROCESS_ATTACH`) so PSP 7's internal save pipeline treats WebP (`0x0B`) identically to PNG (`0x1C`) for alpha channel extraction, suppresses the false *"limited to a merged image"* flatten warning dialog, and routes the **Save As... → Options...** button to the WebP configuration dialog.
+- Hooks the `Paste As New Image` command: if the clipboard contains a PNG with real transparency, it is written to a temporary file, opened through PSP's own `Open` path (so transparency is imported exactly as with `File` > `Open`) and deleted right after, without adding it to the recent files list. Otherwise the original paste runs unchanged.
 
 The rarely-used **IFF (Amiga)** format slot is repurposed for WebP. All other image formats (BMP, JPEG, PNG, GIF, TIFF, PSD, etc.) continue working normally through the original DLL.
 
 The built-in **Browser** window also supports WebP — thumbnails are generated and displayed just like any other supported format.
+
 
 ### Decode flow
 
